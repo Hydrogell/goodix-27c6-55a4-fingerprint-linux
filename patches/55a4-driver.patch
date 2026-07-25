@@ -280,10 +280,10 @@ index 417a37c..5a68810 100644
      }
  }
 diff --git a/libfprint/drivers/goodixtls/goodix55x4.c b/libfprint/drivers/goodixtls/goodix55x4.c
-index 20db582..7a3e911 100644
+index 20db582..06d29da 100644
 --- a/libfprint/drivers/goodixtls/goodix55x4.c
 +++ b/libfprint/drivers/goodixtls/goodix55x4.c
-@@ -51,7 +51,50 @@
+@@ -51,7 +51,55 @@
  // extra end
  #define GOODIX55X4_RAW_FRAME_SIZE                                              \
    (GOODIX55X4_HEIGHT * GOODIX55X4_SCAN_WIDTH) / 4 * 6
@@ -298,12 +298,17 @@ index 20db582..7a3e911 100644
 +#define GOODIX55X4_CAP_FRAMES 1
 +
 +// Host-side touch detection: poll captured frames and diff them against the
-+// calibration background until real content appears. This backs up the
-+// device-side FDT gate rather than replacing it — with correct per-sensor
-+// thresholds FDT_DOWN does block on this firmware, but the diff check keeps a
-+// glancing or partial contact from being captured as a fingerprint.
-+// (Historical note: this polling was introduced together with the hardcoded
-+// 55b4 thresholds, which could never fire on a 55a4 and made FDT look broken.)
++// calibration background until real content appears.
++//
++// This mechanism — frame_diff_score(), retry_finger_poll(), poll_attempts and
++// the constants below — was written by sidevesh for TheWeirdDev/libfprint PR #4
++// (https://github.com/TheWeirdDev/libfprint/pull/4), LGPL-2.1+ like this file.
++// It is not original to this driver; what changed here is the threshold and the
++// runtime override, and its role: PR #4 needed it because FDT_DOWN appeared not
++// to block, but that turned out to be the hardcoded 55b4 thresholds, which can
++// never fire on a 55a4. With per-sensor thresholds FDT_DOWN does block, so the
++// poll is kept as a backstop — it still stops a glancing or partial contact
++// from being captured as a fingerprint.
 +#define GOODIX55X4_FINGER_DETECT_MAX_ATTEMPTS 100
 +#define GOODIX55X4_FINGER_DETECT_POLL_DELAY_MS 100
 +// Mean per-pixel absolute difference from the background needed to accept a
@@ -335,7 +340,7 @@ index 20db582..7a3e911 100644
  
  typedef unsigned short Goodix55X4Pix;
  
-@@ -61,6 +104,40 @@ struct _FpiDeviceGoodixTls55X4 {
+@@ -61,6 +109,40 @@ struct _FpiDeviceGoodixTls55X4 {
    guint8 *otp;
  
    GSList *frames;
@@ -376,7 +381,7 @@ index 20db582..7a3e911 100644
  
    Goodix55X4Pix empty_img[GOODIX55X4_FRAME_SIZE];
  };
-@@ -71,7 +148,18 @@ G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4, FPI,
+@@ -71,7 +153,18 @@ G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4, FPI,
  G_DEFINE_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4,
                FPI_TYPE_DEVICE_GOODIXTLS);
  
@@ -396,7 +401,7 @@ index 20db582..7a3e911 100644
  
  // ---- ACTIVE SECTION START ----
  
-@@ -106,7 +194,12 @@ static void check_firmware_version(FpDevice *dev, gchar *firmware,
+@@ -106,7 +199,12 @@ static void check_firmware_version(FpDevice *dev, gchar *firmware,
    fp_dbg("Device firmware: \"%s\"", firmware);
    g_print("%s\n", firmware);
  
@@ -410,7 +415,7 @@ index 20db582..7a3e911 100644
      g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                  "Invalid device firmware: \"%s\"", firmware);
      fpi_ssm_mark_failed(user_data, error);
-@@ -340,6 +433,10 @@ static void activate_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
+@@ -340,6 +438,10 @@ static void activate_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
  
  enum SCAN_STAGES {
    SCAN_STAGE_CALIBRATE,
@@ -421,7 +426,7 @@ index 20db582..7a3e911 100644
    SCAN_STAGE_SWITCH_TO_FDT_MODE,
    SCAN_STAGE_SWITCH_TO_FDT_DOWN,
    SCAN_STAGE_GET_IMG,
-@@ -348,11 +445,17 @@ enum SCAN_STAGES {
+@@ -348,11 +450,17 @@ enum SCAN_STAGES {
    SCAN_STAGE_SWITCH_TO_FDT_UP,
  //  SCAN_STAGE_SWITCH_TO_SLEEP_MODE,
  //  SCAN_STAGE_SWITCH_TO_SLEEP_MODE_REALTEK,
@@ -439,7 +444,7 @@ index 20db582..7a3e911 100644
    SLEEP_STAGE_SWITCH_TO_SLEEP_MODE,
    SLEEP_STAGE_SWITCH_TO_SLEEP_MODE_REALTEK,
    SLEEP_STAGE_DEACTIVATE,
-@@ -360,6 +463,61 @@ enum SLEEP_STAGES {
+@@ -360,6 +468,61 @@ enum SLEEP_STAGES {
  };
  
  
@@ -501,7 +506,7 @@ index 20db582..7a3e911 100644
  static void check_none_cmd(FpDevice *dev, guint8 *data, guint16 len,
                             gpointer ssm, GError *err) {
    if (err) {
-@@ -429,26 +587,54 @@ static void squash_frame(Goodix55X4Pix *frame, guint8 *squashed) {
+@@ -429,26 +592,54 @@ static void squash_frame(Goodix55X4Pix *frame, guint8 *squashed) {
   * @param squashed
   */
  static void squash_frame_linear(Goodix55X4Pix *frame, guint8 *squashed) {
@@ -568,7 +573,7 @@ index 20db582..7a3e911 100644
    }
  }
  
-@@ -480,6 +666,16 @@ postprocess_frame(Goodix55X4Pix frame[GOODIX55X4_FRAME_SIZE],
+@@ -480,6 +671,16 @@ postprocess_frame(Goodix55X4Pix frame[GOODIX55X4_FRAME_SIZE],
    return sum != 0;
  }
  
@@ -585,7 +590,7 @@ index 20db582..7a3e911 100644
  typedef struct _frame_processing_info {
    FpiDeviceGoodixTls55X4 *dev;
    GSList **frames;
-@@ -502,6 +698,11 @@ static void save_frame(FpiDeviceGoodixTls55X4 *self, guint8 *raw) {
+@@ -502,6 +703,11 @@ static void save_frame(FpiDeviceGoodixTls55X4 *self, guint8 *raw) {
    self->frames = g_slist_append(self->frames, frame);
  }
  
@@ -597,7 +602,7 @@ index 20db582..7a3e911 100644
  static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
                               gpointer ssm, GError *err) {
    g_print("SCAN_ON_READ_IMG\n");
-@@ -511,41 +712,93 @@ static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
+@@ -511,41 +717,93 @@ static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
    }
  
    FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
@@ -719,7 +724,7 @@ index 20db582..7a3e911 100644
  }
  
  gboolean save_image_to_pgm2(guchar *data, const char *path) {
-@@ -607,11 +860,36 @@ gboolean save_image_to_pgm(FpImage *img, const char *path) {
+@@ -607,11 +865,36 @@ gboolean save_image_to_pgm(FpImage *img, const char *path) {
  }
  
  enum scan_empty_img_state {
@@ -756,7 +761,7 @@ index 20db582..7a3e911 100644
  static void on_scan_empty_img(FpDevice *dev, guint8 *data, guint16 length,
                                gpointer ssm, GError *error) {
    if (error) {
-@@ -619,16 +897,132 @@ static void on_scan_empty_img(FpDevice *dev, guint8 *data, guint16 length,
+@@ -619,16 +902,132 @@ static void on_scan_empty_img(FpDevice *dev, guint8 *data, guint16 length,
      return;
    }
    FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
@@ -893,7 +898,7 @@ index 20db582..7a3e911 100644
    case SCAN_EMPTY_GET_IMG:
      goodix_tls_read_image(dev, on_scan_empty_img, ssm);
      break;
-@@ -665,23 +1059,50 @@ const guint8 fdt_switch_state_up_55X4[] = {
+@@ -665,23 +1064,50 @@ const guint8 fdt_switch_state_up_55X4[] = {
  
  static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
    FpImageDevice *img_dev = FP_IMAGE_DEVICE(dev);
@@ -951,7 +956,7 @@ index 20db582..7a3e911 100644
      break;
    case SCAN_STAGE_GET_IMG:
      g_print("SWITCH TO GET IMAGE\n");
-@@ -696,21 +1117,45 @@ static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
+@@ -696,21 +1122,45 @@ static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
      break;
    case SCAN_STAGE_SWITCH_TO_FDT_MODE2:
      g_print("SWITCH TO FDT MODE 2\n");
@@ -1007,7 +1012,7 @@ index 20db582..7a3e911 100644
      break;
    case SCAN_STAGE_SWITCH_TO_FDT_DONE:
      fpi_image_device_report_finger_status(img_dev, FALSE);
-@@ -772,6 +1217,7 @@ static void sleep_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
+@@ -772,6 +1222,7 @@ static void sleep_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
  }
  
  static void scan_start(FpiDeviceGoodixTls55X4 *dev) {
@@ -1015,7 +1020,7 @@ index 20db582..7a3e911 100644
    fpi_ssm_start(fpi_ssm_new(FP_DEVICE(dev), scan_run_state, SCAN_STAGE_NUM),
                  scan_complete);
  }
-@@ -787,6 +1233,7 @@ static void sleep_start(FpDevice *dev, gpointer user_data) {
+@@ -787,6 +1238,7 @@ static void sleep_start(FpDevice *dev, gpointer user_data) {
  
  static void dev_init(FpImageDevice *img_dev) {
    FpDevice *dev = FP_DEVICE(img_dev);
@@ -1023,7 +1028,7 @@ index 20db582..7a3e911 100644
    GError *error = NULL;
  
    if (goodix_dev_init(dev, &error)) {
-@@ -794,6 +1241,13 @@ static void dev_init(FpImageDevice *img_dev) {
+@@ -794,6 +1246,13 @@ static void dev_init(FpImageDevice *img_dev) {
      return;
    }
  
@@ -1037,7 +1042,7 @@ index 20db582..7a3e911 100644
    fpi_image_device_open_complete(img_dev, NULL);
  }
  
-@@ -801,6 +1255,16 @@ static void dev_deinit(FpImageDevice *img_dev) {
+@@ -801,6 +1260,16 @@ static void dev_deinit(FpImageDevice *img_dev) {
    FpDevice *dev = FP_DEVICE(img_dev);
    GError *error = NULL;
  
@@ -1054,7 +1059,7 @@ index 20db582..7a3e911 100644
    if (goodix_dev_deinit(dev, &error)) {
      fpi_image_device_close_complete(img_dev, error);
      return;
-@@ -838,7 +1302,7 @@ static void dev_deactivate(FpImageDevice *img_dev) {
+@@ -838,7 +1307,7 @@ static void dev_deactivate(FpImageDevice *img_dev) {
  // ---- DEV SECTION END ----
  
  static void fpi_device_goodixtls55x4_init(FpiDeviceGoodixTls55X4 *self) {
@@ -1063,7 +1068,7 @@ index 20db582..7a3e911 100644
  }
  
  static void
-@@ -855,7 +1319,11 @@ fpi_device_goodixtls55x4_class_init(FpiDeviceGoodixTls55X4Class *class) {
+@@ -855,7 +1324,11 @@ fpi_device_goodixtls55x4_class_init(FpiDeviceGoodixTls55X4Class *class) {
    dev_class->full_name = "Goodix TLS Fingerprint Sensor 55X4";
    dev_class->type = FP_DEVICE_TYPE_USB;
    dev_class->id_table = id_table;

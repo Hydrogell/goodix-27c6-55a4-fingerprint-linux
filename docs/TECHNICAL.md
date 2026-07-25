@@ -278,9 +278,14 @@ Base = TheWeirdDev/libfprint `55b4-experimental` @ `d1ca62a`. On top:
   tear down TLS, re-handshake, retry the image (2 tries) — the fw actively
   participates in the re-handshake, so this self-heals transient cases.
 - **PSK-read byte-exact with Python** (8-byte payload flags+len=0).
-- **host-side finger-detect** (poll frames, diff vs `empty_img`) — added by this
-  patch; the base revision has none. It backs up the device-side FDT gate rather
-  than replacing it, and stops a glancing contact being captured as a print.
+- **host-side finger-detect** (poll frames, diff vs `empty_img`) — **sidevesh's
+  code**, from [TheWeirdDev/libfprint PR #4][pr4]; not in the base revision, and
+  not written here. This patch raises its threshold 100 → 300, adds a runtime
+  override, and demotes it from the primary detection mechanism to a backstop
+  against glancing contact, because the FDT fix above makes the device-side gate
+  work as it should.
+
+[pr4]: https://github.com/TheWeirdDev/libfprint/pull/4
 - **firmware 10063 + lenient fw check** (`GF32*_RTSEC_APP_100*` — chip
   flip-flops GF3208<->GF3268 across cold boots).
 - **cipher `PSK:@SECLEVEL=0`**, TLS1.2 only (OpenSSL 3.5 dropped PSK-CBC).

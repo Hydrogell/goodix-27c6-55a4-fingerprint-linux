@@ -295,10 +295,21 @@ Protocol groundwork, the device config and the whitebox PSK come from
 [goodix-fp-dump][gfd]. The patch in `patches/` is a derivative of libfprint and
 carries LGPL-2.1+; the scripts in this repository are under the same terms.
 
+**The host-side finger-detect poll is [sidevesh][pr4]'s work**, not this
+author's: `frame_diff_score()`, `retry_finger_poll()`, the `poll_attempts`
+counter and the `GOODIX55X4_FINGER_DETECT_*` constants all come from
+[TheWeirdDev/libfprint PR #4][pr4], LGPL-2.1+ like the rest. What this repository
+changed is the threshold (100 → 300, plus a runtime override) and the role: with
+the FDT fix below, device-side detection works, so the poll is a backstop
+against glancing contact rather than the primary mechanism it had to be before.
+
+[pr4]: https://github.com/TheWeirdDev/libfprint/pull/4
+
 ### How the protocol behaviour was established
 
-**No vendor code is included, and none was copied.** Everything in `patches/` was
-written from scratch against libfprint's own API.
+**No vendor code is included, and none was copied** — nothing in `patches/` comes
+from the Windows driver. Third-party open-source code that *is* in the patch is
+credited above.
 
 Three sources, all on the author's own hardware:
 
