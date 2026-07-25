@@ -1,0 +1,30 @@
+# The developer build tree: two checkouts and a venv, fetched by ./setup.sh.
+# This is the only directory this project ever writes into. ./install.sh builds
+# in a temporary directory instead and leaves nothing here at all.
+/work/
+
+# Python bytecode, from running the helper scripts in place
+__pycache__/
+*.py[cod]
+
+# Editors and desktop environments
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# --- Safety net, not housekeeping -------------------------------------------
+# Nothing here writes these into the repository: captures go to
+# ~/goodix-captures, test images and logs go to /tmp, the SELinux module is
+# built in a temporary directory. The patterns exist because the cost of one
+# mistake is uniquely high.
+#
+# A USB trace of this sensor is a fingerprint image. The TLS session uses a
+# publicly known all-zero pre-shared key, so anyone who obtains the file can
+# decrypt it. The same goes for a raw frame dump. See CONTRIBUTING.md.
+*.pcapng
+*.pcap
+*.pgm
+*.raw
+otp.bin

@@ -1,0 +1,1227 @@
+diff --git a/libfprint/drivers/goodixtls/goodix.c b/libfprint/drivers/goodixtls/goodix.c
+index 417a37c..5a68810 100644
+--- a/libfprint/drivers/goodixtls/goodix.c
++++ b/libfprint/drivers/goodixtls/goodix.c
+@@ -56,6 +56,18 @@ typedef struct
+ 
+   GCancellable       *transfer_cancel_tkn;
+   gboolean            inited;
++  /* TRUE while a bulk-IN URB is in flight on the data endpoint. Guarantees at
++     most ONE pending IN read, and only while a command awaits data — the exact
++     pattern of the working pyusb reference and the Windows driver. Stacked or
++     pre-command IN URBs make the 55a4 fw answer GET_IMAGE with 0xd0. */
++  gboolean            read_pending;
++
++  /* "Obey 0xd0": when the fw answers GET_IMAGE with REQUEST_TLS_CONNECTION,
++     comply — re-establish TLS and retry the image request. These hold the
++     original image request's callback across the re-handshake. */
++  GoodixCmdCallback   reimage_callback;
++  gpointer            reimage_user_data;
++  guint               reimage_tries;
+ } FpiDeviceGoodixTlsPrivate;
+ 
+ G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (FpiDeviceGoodixTls, fpi_device_goodixtls,
+@@ -77,6 +89,9 @@ data_to_str (guint8 *data, guint32 length)
+ 
+ // ---- GOODIX RECEIVE SECTION START ----
+ 
++static void goodix_reimage_tls_ready (FpDevice *dev, gpointer user_data,
++                                      GError *error);
++
+ void
+ goodix_receive_done (FpDevice *dev, guint8 *data, guint16 length,
+                      GError *error)
+@@ -351,6 +366,37 @@ goodix_receive_protocol (FpDevice *dev, guint8 *data, guint32 length)
+       return;
+     }
+ 
++  /* "Obey 0xd0": the 55a4 fw sometimes answers GET_IMAGE with an unsolicited
++     REQUEST_TLS_CONNECTION instead of the encrypted frame — it wants the TLS
++     session (re)established. Comply: tear the TLS server down, run a fresh
++     handshake, then retry the image request with the original callback. */
++  if (cmd == GOODIX_CMD_REQUEST_TLS_CONNECTION &&
++      priv->cmd == GOODIX_CMD_MCU_GET_IMAGE && priv->reply)
++    {
++      if (priv->reimage_tries >= 2)
++        {
++          GError *err = g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
++                                     "fw kept requesting TLS re-establishment "
++                                     "instead of returning an image");
++          // Reset before bailing out: the only other place this is cleared is
++          // a successfully decrypted image, which is exactly what just failed —
++          // leaving it latched disables 0xd0 recovery for the rest of the
++          // session.
++          priv->reimage_tries = 0;
++          goodix_receive_done (dev, NULL, 0, err);
++          return;
++        }
++      priv->reimage_tries++;
++      fp_dbg ("fw requested TLS re-establishment instead of image; "
++              "complying (try %u)", priv->reimage_tries);
++      priv->reimage_callback = priv->callback;
++      priv->reimage_user_data = priv->user_data;
++      goodix_reset_state (dev);
++      goodix_shutdown_tls (dev, NULL);
++      goodix_tls (dev, goodix_reimage_tls_ready, NULL);
++      return;
++    }
++
+   if (priv->cmd != cmd)
+     {
+       fp_warn ("Invalid protocol command: 0x%02x", cmd);
+@@ -409,6 +455,7 @@ goodix_receive_pack (FpDevice *dev, guint8 *data, guint32 length)
+ 
+     case GOODIX_FLAGS_TLS_DATA:
+         fp_dbg("Got TLS data msg");
++        priv->reimage_tries = 0;
+         // GOODIX 55x4: Remove first 9 to get valid TLS content
+         goodix_receive_done(dev, payload+9, payload_len-9, NULL);
+         break;
+@@ -422,6 +469,32 @@ goodix_receive_pack (FpDevice *dev, guint8 *data, guint32 length)
+   priv->length = 0;
+ }
+ 
++static void
++goodix_reimage_tls_ready (FpDevice *dev, gpointer user_data, GError *error)
++{
++  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
++  FpiDeviceGoodixTlsPrivate *priv =
++    fpi_device_goodixtls_get_instance_private (self);
++  GoodixCmdCallback cb = priv->reimage_callback;
++  gpointer ud = priv->reimage_user_data;
++  GoodixDefault payload = {.unused_flags = 0x01};
++
++  priv->reimage_callback = NULL;
++  priv->reimage_user_data = NULL;
++
++  if (error)
++    {
++      if (cb)
++        cb (dev, NULL, 0, ud, error);
++      return;
++    }
++
++  fp_dbg ("TLS re-established; retrying GET_IMAGE");
++  goodix_send_protocol (dev, GOODIX_CMD_MCU_GET_IMAGE, (guint8 *) &payload,
++                        sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
++                        cb, ud);
++}
++
+ void
+ goodix_receive_data_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                         gpointer user_data, GError *error)
+@@ -430,6 +503,8 @@ goodix_receive_data_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+   FpiDeviceGoodixTlsPrivate *priv =
+     fpi_device_goodixtls_get_instance_private (self);
+ 
++  priv->read_pending = FALSE;
++
+   if (g_cancellable_is_cancelled (priv->transfer_cancel_tkn))
+     {
+       fp_dbg ("transfer cancelled, aborting read loop...");
+@@ -441,14 +516,26 @@ goodix_receive_data_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+       fp_warn ("Receive data error: %s", error->message);
+       g_error_free (error);
+ 
+-      // Retry receiving data and return.
+-      goodix_receive_data (dev);
++      // Retry only while a command is still waiting for data. Re-arming
++      // unconditionally re-creates the perpetual bulk-IN read this driver
++      // deliberately removed, and on a disappearing device it becomes a
++      // self-feeding error loop: every failed transfer immediately submits
++      // another one.
++      if (priv->ack || priv->reply)
++        goodix_receive_data (dev);
+       return;
+     }
+ 
+   goodix_receive_pack (dev, transfer->buffer, transfer->actual_length);
+ 
+-  goodix_receive_data (dev);
++  /* On-demand reads (mirror the working pyusb path): only keep an IN transfer
++     pending while a command still expects data. A perpetually-pending bulk-IN
++     read on EP 0x82 makes the 55a4 firmware answer GET_IMAGE with a protocol
++     REQUEST_TLS_CONNECTION (0xd0) instead of the encrypted frame. The Python
++     reference issues an IN read only after a command is written and while its
++     ACK/reply are still outstanding — replicate that here. */
++  if (priv->ack || priv->reply)
++    goodix_receive_data (dev);
+ }
+ 
+ void
+@@ -479,7 +566,11 @@ goodix_start_read_loop (FpDevice *dev)
+   if (g_cancellable_is_cancelled (priv->transfer_cancel_tkn))
+     g_cancellable_reset (priv->transfer_cancel_tkn);
+ 
+-  goodix_receive_data (dev);
++  /* On-demand read model: do NOT submit a perpetual bulk-IN read here. Reads
++     are issued by goodix_send_protocol() / goodix_read_tls() right after a
++     command is written, and re-issued only while an ACK/reply is still
++     outstanding. A perpetually-pending IN read on EP 0x82 makes the 55a4
++     firmware reply to GET_IMAGE with REQUEST_TLS_CONNECTION (0xd0). */
+ }
+ 
+ void
+@@ -487,10 +578,16 @@ goodix_receive_data (FpDevice *dev)
+ {
+   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+   FpiDeviceGoodixTlsClass *class = FPI_DEVICE_GOODIXTLS_GET_CLASS (self);
+-  FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
++  FpiUsbTransfer *transfer;
+   FpiDeviceGoodixTlsPrivate *priv =
+     fpi_device_goodixtls_get_instance_private (self);
+ 
++  if (priv->read_pending)
++    // One IN URB at a time; the completion callback re-issues as needed.
++    return;
++  priv->read_pending = TRUE;
++
++  transfer = fpi_usb_transfer_new (dev);
+   transfer->short_is_error = FALSE;
+ 
+   fpi_usb_transfer_fill_bulk (transfer, class->ep_in,
+@@ -513,12 +610,24 @@ goodix_send_data (FpDevice *dev, guint8 *data, guint32 length,
+   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+   FpiDeviceGoodixTlsClass *class = FPI_DEVICE_GOODIXTLS_GET_CLASS (self);
+ 
++  /* The working Python path (pyusb, protocol.py) zero-pads the payload up to a
++     multiple of GOODIX_EP_OUT_MAX_BUF_SIZE (0x40) and always transmits full
++     64-byte packets. The device parses the a0-frame length field and ignores
++     the zero tail. Replicate that exactly: pad with ZEROS (not heap garbage,
++     which the original did, and not a short last packet, which the "exact
++     length" variant did). */
+   for (guint32 i = 0; i < length; i += GOODIX_EP_OUT_MAX_BUF_SIZE)
+     {
+       FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
+       transfer->short_is_error = TRUE;
+ 
+-      fpi_usb_transfer_fill_bulk_full (transfer, class->ep_out, data + i,
++      guint8 packet[GOODIX_EP_OUT_MAX_BUF_SIZE];
++      guint32 chunk = length - i;
++      if (chunk > GOODIX_EP_OUT_MAX_BUF_SIZE)
++        chunk = GOODIX_EP_OUT_MAX_BUF_SIZE;
++      memset (packet, 0, sizeof (packet));
++      memcpy (packet, data + i, chunk);
++      fpi_usb_transfer_fill_bulk_full (transfer, class->ep_out, packet,
+                                        GOODIX_EP_OUT_MAX_BUF_SIZE, NULL);
+ 
+       if (!fpi_usb_transfer_submit_sync (transfer, GOODIX_TIMEOUT,
+@@ -596,7 +705,11 @@ goodix_send_protocol (
+       goodix_receive_done (dev, NULL, 0, error);
+       return;
+     }
+-  ;
++
++  /* Kick a single IN read now that the command is on the wire (on-demand read
++     model, matching the pyusb reference). */
++  if (priv->ack || priv->reply)
++    goodix_receive_data (dev);
+ }
+ void
+ goodix_send_nop (FpDevice *dev, GoodixNoneCallback callback,
+@@ -1242,8 +1355,14 @@ goodix_send_preset_psk_write (FpDevice *dev, guint32 flags, guint8 *psk,
+ void goodix_send_preset_psk_read(FpDevice *dev, guint32 flags, guint16 length,
+                                  GoodixPresetPskReadCallback callback,
+                                  gpointer user_data) {
+-  GoodixPresetPsk payload = {.flags = GUINT32_TO_LE(flags),
+-                             .length = GUINT32_TO_LE(length)};
++  /* Byte-exact match of the working pyusb reference: 8-byte payload of
++     flags + length=0 (the fw returns the PSK hash regardless). The previous
++     12-byte {flags, length=32, offset} variant is the ONLY command whose
++     bytes differed from the proven-working Python sequence. */
++  struct __attribute__((__packed__)) {
++    guint32 flags;
++    guint32 length;
++  } payload = {.flags = GUINT32_TO_LE(flags), .length = 0};
+   GoodixCallbackInfo *cb_info;
+ 
+   if (callback)
+@@ -1285,6 +1404,10 @@ goodix_dev_init (FpDevice *dev, GError **error)
+   priv->user_data = NULL;
+   priv->data = NULL;
+   priv->length = 0;
++  priv->read_pending = FALSE;
++  priv->reimage_callback = NULL;
++  priv->reimage_user_data = NULL;
++  priv->reimage_tries = 0;
+   priv->transfer_cancel_tkn = g_cancellable_new ();
+ 
+   return g_usb_device_claim_interface (fpi_device_get_usb_device (dev),
+@@ -1303,6 +1426,7 @@ goodix_reset_state (FpDevice *dev)
+   priv->reply = FALSE;
+   priv->callback = NULL;
+   priv->user_data = NULL;
++  priv->reimage_tries = 0;
+ }
+ 
+ void
+@@ -1354,6 +1478,10 @@ goodix_read_tls (FpDevice *dev, GoodixTlsCallback callback,
+   priv->user_data = user_data;
+   priv->reply = TRUE;
+   priv->cmd = 0;
++
++  /* On-demand read model: issue the IN read for this TLS handshake message now
++     (no perpetually-pending read loop). */
++  goodix_receive_data (dev);
+ }
+ 
+ enum tls_states {
+@@ -1490,6 +1618,12 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
+           fpi_ssm_mark_failed (ssm, err);
+           return;
+         }
++      /* Give the fw quiet time to finalize its TLS session right after the
++         server's ChangeCipherSpec+Finished flight. The pyusb reference sleeps
++         10 ms here ("Important otherwise an USBTimeout error occur"); without
++         it the fw ACKs subsequent plaintext commands but never marks the TLS
++         session ready and answers every GET_IMAGE with 0xd0. */
++      g_usleep (15000);
+       fpi_ssm_next_state (ssm);
+     }
+ }
+diff --git a/libfprint/drivers/goodixtls/goodix55x4.c b/libfprint/drivers/goodixtls/goodix55x4.c
+index 20db582..7a3e911 100644
+--- a/libfprint/drivers/goodixtls/goodix55x4.c
++++ b/libfprint/drivers/goodixtls/goodix55x4.c
+@@ -51,7 +51,50 @@
+ // extra end
+ #define GOODIX55X4_RAW_FRAME_SIZE                                              \
+   (GOODIX55X4_HEIGHT * GOODIX55X4_SCAN_WIDTH) / 4 * 6
+-#define GOODIX55X4_CAP_FRAMES 1 // Number of frames we capture per swipe
++// Frames captured per touch. One: every accuracy figure recorded for this
++// driver was measured with a single frame, and taking more would change the
++// timing the FDT cycle and the baseline guard were tuned against.
++// Averaging N frames would cut noise by ~sqrt(N), but note that is NOT what the
++// stock driver does — it captures several and best-picks one on coverage and
++// quality. Either route is unmeasured here; raising this without re-running the
++// accuracy tests is not an improvement, just a change.
++#define GOODIX55X4_CAP_FRAMES 1
++
++// Host-side touch detection: poll captured frames and diff them against the
++// calibration background until real content appears. This backs up the
++// device-side FDT gate rather than replacing it — with correct per-sensor
++// thresholds FDT_DOWN does block on this firmware, but the diff check keeps a
++// glancing or partial contact from being captured as a fingerprint.
++// (Historical note: this polling was introduced together with the hardcoded
++// 55b4 thresholds, which could never fire on a 55a4 and made FDT look broken.)
++#define GOODIX55X4_FINGER_DETECT_MAX_ATTEMPTS 100
++#define GOODIX55X4_FINGER_DETECT_POLL_DELAY_MS 100
++// Mean per-pixel absolute difference from the background needed to accept a
++// frame as a real touch. Field-calibrated on one 55a4 with one person's finger:
++// an idle plate sits at ~4-5, the rising edge of a touch spans ~130-770 and a
++// settled firm contact plateaus around 950. 300 accepts a real contact with
++// margin for pressure dips while rejecting a glancing one — but dry skin, a
++// different sensor or a different person can move this, so it is overridable
++// at runtime rather than being one subject's constant baked into the driver:
++//     GOODIX55X4_TOUCH_DIFF=200 systemctl restart fprintd
++#define GOODIX55X4_FINGER_DETECT_DIFF_THRESHOLD 300
++
++// The FDT (finger-detect) commands carry one threshold byte per detection zone.
++// These thresholds are NOT constants: they are derived from the base level this
++// particular sensor measures, which the device reports in its reply to
++// FDT_MODE. Verified against a USB observation of the stock driver on this
++// exact sensor: when it arms detection from a clean (no-finger) baseline, the
++// threshold it sends equals (measured base >> 1) in all 12 zones, byte-exact —
++// e.g. base 363 -> 0xb5, 410 -> 0xcd, 396 -> 0xc6. During an active scan the
++// stock driver adds a margin on top of that; we do not, and do not need to,
++// because we re-arm from a fresh baseline rather than from a loaded plate.
++// The hardcoded tables below come from a different (55b4) unit and are wildly
++// wrong for ours (0x12 vs 0xb5), which is why device-side finger detection
++// never triggered here and a host-side polling workaround was bolted on.
++#define GOODIX55X4_FDT_ZONES 12
++#define GOODIX55X4_FDT_PAYLOAD_LEN (2 + GOODIX55X4_FDT_ZONES * 2)
++// Reply layout of FDT_MODE: 4 header bytes then one LE uint16 base per zone.
++#define GOODIX55X4_FDT_REPLY_HDR 4
+ 
+ typedef unsigned short Goodix55X4Pix;
+ 
+@@ -61,6 +104,40 @@ struct _FpiDeviceGoodixTls55X4 {
+   guint8 *otp;
+ 
+   GSList *frames;
++  guint poll_attempts;
++
++  // Per-zone finger-detect thresholds measured from this sensor (see above).
++  guint8 fdt_thresholds[GOODIX55X4_FDT_ZONES];
++  gboolean fdt_thresholds_valid;
++
++  // The background frame is valid for the whole activation. Re-deriving it at
++  // the head of every scan (as this driver used to) means recapturing it
++  // moments after the previous press, while the plate still carries the
++  // finger's warmth/moisture — a contaminated baseline that then corrupts
++  // every |frame - baseline| image. The vendor driver refuses to recapture
++  // while a finger may be present ("image base not valid, wait fdt up") and
++  // refreshes only on a confirmed finger-up.
++  gboolean empty_img_valid;
++
++  // Validating a baseline candidate before accepting it. A plate with no finger
++  // on it is essentially static, so two frames a moment apart are nearly
++  // identical; a finger resting, settling or lifting makes them differ a lot.
++  // Accepting a finger-contaminated baseline is what made the *lift* register
++  // as a second touch: every later frame is |frame - baseline|, so removing the
++  // finger produced a huge difference against a baseline that contained it.
++  Goodix55X4Pix cal_prev[GOODIX55X4_FRAME_SIZE];
++  gboolean cal_have_prev;
++  guint cal_attempts;
++
++  // Current LED state, so the switch command is only sent on an actual change.
++  // The scan SSM restarts on every retry and on every enrollment stage, and
++  // re-sending "on" each time made the light blink off and on again instead of
++  // staying lit for as long as the system is asking for a finger.
++  gboolean led_is_on;
++  gboolean led_want_on;
++
++  // Effective touch threshold; see GOODIX55X4_TOUCH_DIFF.
++  double touch_diff;
+ 
+   Goodix55X4Pix empty_img[GOODIX55X4_FRAME_SIZE];
+ };
+@@ -71,7 +148,18 @@ G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4, FPI,
+ G_DEFINE_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4,
+               FPI_TYPE_DEVICE_GOODIXTLS);
+ 
+-static void goodix55X4_reset_state(FpiDeviceGoodixTls55X4 *self) {}
++static void goodix55X4_reset_state(FpiDeviceGoodixTls55X4 *self) {
++  // Called on deactivate: the cached background and the leftover frame list
++  // belong to the finished activation. Dropping the frames also stops a
++  // half-finished scan from bleeding its frames into the next press.
++  self->empty_img_valid = FALSE;
++  self->cal_have_prev = FALSE;
++  self->cal_attempts = 0;
++  if (self->frames) {
++    g_slist_free_full(self->frames, g_free);
++    self->frames = NULL;
++  }
++}
+ 
+ // ---- ACTIVE SECTION START ----
+ 
+@@ -106,7 +194,12 @@ static void check_firmware_version(FpDevice *dev, gchar *firmware,
+   fp_dbg("Device firmware: \"%s\"", firmware);
+   g_print("%s\n", firmware);
+ 
+-  if (strcmp(firmware, GOODIX_55X4_FIRMWARE_VERSION)) {
++  /* The chip flip-flops its reported family string between GF3208 and GF3268
++     across cold boots; the meaningful part is the RTSEC_APP version. Accept
++     any GF32xx_RTSEC_APP_100xx (matches goodix-fp-dump's VALID_FIRMWARE regex)
++     instead of an exact strcmp against one prefix. */
++  if (!g_str_has_prefix(firmware, "GF32") ||
++      !strstr(firmware, "_RTSEC_APP_100")) {
+     g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                 "Invalid device firmware: \"%s\"", firmware);
+     fpi_ssm_mark_failed(user_data, error);
+@@ -340,6 +433,10 @@ static void activate_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
+ 
+ enum SCAN_STAGES {
+   SCAN_STAGE_CALIBRATE,
++  // The LED switch is a normal protocol command, and the transport allows only
++  // one command in flight — firing it from inside another stage silently drops
++  // whatever is sent next. It therefore gets stages of its own.
++  SCAN_STAGE_LED_ON,
+   SCAN_STAGE_SWITCH_TO_FDT_MODE,
+   SCAN_STAGE_SWITCH_TO_FDT_DOWN,
+   SCAN_STAGE_GET_IMG,
+@@ -348,11 +445,17 @@ enum SCAN_STAGES {
+   SCAN_STAGE_SWITCH_TO_FDT_UP,
+ //  SCAN_STAGE_SWITCH_TO_SLEEP_MODE,
+ //  SCAN_STAGE_SWITCH_TO_SLEEP_MODE_REALTEK,
++  // NOTE: no LED-off stage here on purpose. A scan restarts per retry and per
++  // enrollment stage, so switching the light off at the end of each one made it
++  // blink between touches. It stays lit for as long as the system is asking for
++  // a finger and is cleared once, when the device is closed (dev_deinit).
+   SCAN_STAGE_SWITCH_TO_FDT_DONE,
+   SCAN_STAGE_NUM,
+ };
+ 
+ enum SLEEP_STAGES {
++  // No LED stage here: see dev_deinit(). The light must survive deactivation,
++  // otherwise it blinks between a failed attempt and its retry.
+   SLEEP_STAGE_SWITCH_TO_SLEEP_MODE,
+   SLEEP_STAGE_SWITCH_TO_SLEEP_MODE_REALTEK,
+   SLEEP_STAGE_DEACTIVATE,
+@@ -360,6 +463,61 @@ enum SLEEP_STAGES {
+ };
+ 
+ 
++/**
++ * @brief Drive the sensor's status LED.
++ *
++ * The LED is not wired to the laptop EC as long assumed — it is switched by
++ * command 0xae, which the community protocol notes call "QUERY_MCU_STATE" and
++ * which therefore looked like a harmless read. It is not: the Windows driver
++ * sends it in strictly alternating pairs, and the two payloads simply swap
++ * their first two bytes:
++ *
++ *     00 01 32  -> LED on
++ *     01 00 32  -> LED off
++ *
++ * Confirmed on real hardware. Windows lights it while waiting for a finger,
++ * which is why the light only ever appeared during its lock screen.
++ */
++static void goodix55x4_led_done(FpDevice *dev, guint8 *data, guint16 len,
++                                gpointer ssm, GError *error) {
++  FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
++
++  if (error) {
++    // The light is cosmetic; it must never be able to fail an authentication.
++    fp_warn("LED command failed, continuing without it: %s", error->message);
++    g_error_free(error);
++  } else {
++    // Commit the cached state only once the device has actually acknowledged.
++    self->led_is_on = self->led_want_on;
++  }
++
++  if (ssm)
++    fpi_ssm_next_state(ssm);
++}
++
++static void goodix55x4_set_led(FpDevice *dev, gboolean on, FpiSsm *ssm) {
++  FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
++  guint8 payload[3] = {on ? 0x00 : 0x01, on ? 0x01 : 0x00, 0x32};
++
++  // Already in the requested state: skip the command entirely. Sending it again
++  // physically toggles the light, which is what made it blink on every retry
++  // and between enrollment stages. Keep driving the SSM forward though.
++  if (self->led_is_on == on) {
++    if (ssm)
++      fpi_ssm_next_state(ssm);
++    return;
++  }
++
++  // Do NOT commit led_is_on here: goodix_send_protocol() drops the command with
++  // only a warning when the transport is still busy, and never calls back. A
++  // state cached before the send would then claim the light is on while it is
++  // dark, turning every later switch into a no-op.
++  self->led_want_on = on;
++  goodix_send_protocol(dev, GOODIX_CMD_QUERY_MCU_STATE, payload,
++                       sizeof(payload), NULL, TRUE, GOODIX_TIMEOUT, FALSE,
++                       goodix55x4_led_done, ssm);
++}
++
+ static void check_none_cmd(FpDevice *dev, guint8 *data, guint16 len,
+                            gpointer ssm, GError *err) {
+   if (err) {
+@@ -429,26 +587,54 @@ static void squash_frame(Goodix55X4Pix *frame, guint8 *squashed) {
+  * @param squashed
+  */
+ static void squash_frame_linear(Goodix55X4Pix *frame, guint8 *squashed) {
+-  Goodix55X4Pix min = 0xffff;
+-  Goodix55X4Pix max = 0;
++  // Deriving the 8-bit gain from the absolute min/max of the whole frame is
++  // wrong on this sensor for two measured reasons: (1) the 55a4 returns a
++  // hard-zero 1-pixel border (~4% of the frame) which pins min at 0 and throws
++  // away roughly half of the output range on every capture, and (2) max is a
++  // single pixel, so one hot pixel decides the contrast of the entire image —
++  // the direct cause of SIFT keypoint counts swinging 62..235 between presses.
++  // The vendor computes its statistics over a trimmed band instead and treats
++  // out-of-band pixels as broken. Do the same: ignore the border ring and clip
++  // to the 2nd/98th percentile of the interior.
++  guint32 hist[4096] = {0};
++  guint32 n = 0;
++
++  for (int y = 1; y < GOODIX55X4_HEIGHT - 1; ++y) {
++    for (int x = 1; x < GOODIX55X4_WIDTH - 1; ++x) {
++      hist[frame[x + y * GOODIX55X4_WIDTH] & 0xfff]++;
++      n++;
++    }
++  }
+ 
+-  for (int i = 0; i != GOODIX55X4_FRAME_SIZE; ++i) {
+-    const Goodix55X4Pix pix = frame[i];
+-    if (pix < min) {
+-      min = pix;
++  Goodix55X4Pix min = 0, max = 4095;
++  if (n) {
++    const guint32 lo_target = n * 2 / 100;
++    const guint32 hi_target = n - n * 2 / 100;
++    guint32 acc = 0;
++    for (int v = 0; v < 4096; ++v) {
++      acc += hist[v];
++      if (acc > lo_target) { min = (Goodix55X4Pix)v; break; }
+     }
+-    if (pix > max) {
+-      max = pix;
++    acc = 0;
++    for (int v = 0; v < 4096; ++v) {
++      acc += hist[v];
++      if (acc >= hi_target) { max = (Goodix55X4Pix)v; break; }
+     }
+   }
++  if (max <= min)
++    max = (Goodix55X4Pix)(min + 1);
+ 
++  // Pixels outside the trimmed band (including the dead border) clamp to the
++  // ends instead of dragging the gain, so the full 0..255 range is spent on
++  // the band that actually carries ridge detail.
+   for (int i = 0; i != GOODIX55X4_FRAME_SIZE; ++i) {
+     const Goodix55X4Pix pix = frame[i];
+-    if (pix - min == 0 || max - min == 0) {
++    if (pix <= min)
+       squashed[i] = 0;
+-    } else {
+-      squashed[i] = (pix - min) * 0xff / (max - min);
+-    }
++    else if (pix >= max)
++      squashed[i] = 0xff;
++    else
++      squashed[i] = (guint8)(((guint32)(pix - min) * 0xff) / (max - min));
+   }
+ }
+ 
+@@ -480,6 +666,16 @@ postprocess_frame(Goodix55X4Pix frame[GOODIX55X4_FRAME_SIZE],
+   return sum != 0;
+ }
+ 
++static double
++frame_diff_score(Goodix55X4Pix frame[GOODIX55X4_FRAME_SIZE],
++                 Goodix55X4Pix background[GOODIX55X4_FRAME_SIZE]) {
++  guint64 sum = 0;
++  for (int i = 0; i != GOODIX55X4_FRAME_SIZE; ++i) {
++    sum += ABS((int)frame[i] - (int)background[i]);
++  }
++  return (double)sum / GOODIX55X4_FRAME_SIZE;
++}
++
+ typedef struct _frame_processing_info {
+   FpiDeviceGoodixTls55X4 *dev;
+   GSList **frames;
+@@ -502,6 +698,11 @@ static void save_frame(FpiDeviceGoodixTls55X4 *self, guint8 *raw) {
+   self->frames = g_slist_append(self->frames, frame);
+ }
+ 
++static void retry_finger_poll(FpDevice *dev, gpointer user_data) {
++  FpiSsm *ssm = user_data;
++  fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
++}
++
+ static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
+                              gpointer ssm, GError *err) {
+   g_print("SCAN_ON_READ_IMG\n");
+@@ -511,41 +712,93 @@ static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
+   }
+ 
+   FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
+-  save_frame(self, data);
+-  if (g_slist_length(self->frames) <= GOODIX55X4_CAP_FRAMES) {
+-    fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
+-  } else {
+-    GSList *raw_frames = g_slist_nth(self->frames, 1);
+ 
+-    FpImageDevice *img_dev = FP_IMAGE_DEVICE(dev);
+-    struct fpi_frame_asmbl_ctx assembly_ctx;
+-    assembly_ctx.frame_width = GOODIX55X4_WIDTH;
+-    assembly_ctx.frame_height = GOODIX55X4_HEIGHT;
+-    assembly_ctx.image_width = GOODIX55X4_WIDTH * 1;
+-    assembly_ctx.get_pixel = get_pix;
+-
+-    GSList *frames = NULL;
+-    frame_processing_info pinfo = {.dev = self, .frames = &frames};
++  Goodix55X4Pix candidate[GOODIX55X4_FRAME_SIZE];
++  decode_frame(candidate, data);
++
++  double diff = frame_diff_score(candidate, self->empty_img);
++  if (G_UNLIKELY(self->touch_diff <= 0.0)) {
++    const gchar *env = g_getenv("GOODIX55X4_TOUCH_DIFF");
++    self->touch_diff = env ? g_ascii_strtod(env, NULL) : 0.0;
++    if (self->touch_diff <= 0.0)
++      self->touch_diff = GOODIX55X4_FINGER_DETECT_DIFF_THRESHOLD;
++    else
++      fp_info("touch threshold overridden to %.0f", self->touch_diff);
++  }
++  g_print("Finger-detect poll: diff vs background = %.1f\n", diff);
+ 
+-    g_slist_foreach(raw_frames, (GFunc)process_frame, &pinfo);
+-    frames = g_slist_reverse(frames);
++  if (diff < self->touch_diff) {
++    if (++self->poll_attempts >= GOODIX55X4_FINGER_DETECT_MAX_ATTEMPTS) {
++      fpi_ssm_mark_failed(ssm,
++                         fpi_device_retry_new(FP_DEVICE_RETRY_GENERAL));
++      return;
++    }
+ 
+-    g_print("MOVEMENT EST\n");
+-    fpi_do_movement_estimation(&assembly_ctx, frames);
+-    g_print("MOVEMENT EST DOOONEE\n");
+-    FpImage *img = fpi_assemble_frames(&assembly_ctx, frames);
++    fpi_device_add_timeout(dev, GOODIX55X4_FINGER_DETECT_POLL_DELAY_MS,
++                           retry_finger_poll, ssm, NULL);
++    return;
++  }
+ 
+-    g_slist_free_full(frames, g_free);
+-    g_slist_free_full(self->frames, g_free);
+-    self->frames = g_slist_alloc();
++  self->poll_attempts = 0;
++  save_frame(self, data);
+ 
+-    g_print("Signal IMG Capture\n");
+-    fpi_image_device_image_captured(img_dev, img);
+-    // save_image_to_pgm(img, "finger.pgm");
++  /* Multi-frame: keep collecting held frames until we have CAP_FRAMES, then
++     average them pixel-wise. The finger is a static press (not a swipe), so
++     averaging is a defensible fusion — it would cut sensor noise ~1/sqrt(N).
++     It is untested here: CAP_FRAMES is 1, so this path never runs, and the
++     stock driver takes a different route anyway (it best-picks one frame on
++     coverage and quality rather than averaging). Measure before enabling. */
++  if (g_slist_length(self->frames) < GOODIX55X4_CAP_FRAMES) {
++    fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
++    return;
++  }
+ 
+-    g_print("Next State\n");
+-    fpi_ssm_next_state(ssm);
++  guint32 *acc = g_malloc0(GOODIX55X4_FRAME_SIZE * sizeof(guint32));
++  int nframes = 0;
++  for (GSList *l = self->frames; l; l = l->next) {
++    Goodix55X4Pix *f = l->data;
++    for (int i = 0; i != GOODIX55X4_FRAME_SIZE; ++i)
++      acc[i] += f[i];
++    nframes++;
+   }
++  Goodix55X4Pix *avg = g_malloc(GOODIX55X4_FRAME_SIZE * sizeof(Goodix55X4Pix));
++  for (int i = 0; i != GOODIX55X4_FRAME_SIZE; ++i)
++    avg[i] = nframes ? acc[i] / nframes : 0;
++  g_free(acc);
++  g_print("Averaged %d frames\n", nframes);
++
++  FpImageDevice *img_dev = FP_IMAGE_DEVICE(dev);
++  struct fpi_frame *aframe =
++      g_malloc(GOODIX55X4_FRAME_SIZE + sizeof(struct fpi_frame));
++  postprocess_frame(avg, self->empty_img);
++  squash_frame_linear(avg, aframe->data);
++  g_free(avg);
++
++  GSList *frames = g_slist_append(NULL, aframe);
++  struct fpi_frame_asmbl_ctx assembly_ctx;
++  assembly_ctx.frame_width = GOODIX55X4_WIDTH;
++  assembly_ctx.frame_height = GOODIX55X4_HEIGHT;
++  assembly_ctx.image_width = GOODIX55X4_WIDTH;
++  assembly_ctx.get_pixel = get_pix;
++  fpi_do_movement_estimation(&assembly_ctx, frames);
++  FpImage *img = fpi_assemble_frames(&assembly_ctx, frames);
++
++  g_slist_free_full(frames, g_free);
++  g_slist_free_full(self->frames, g_free);
++  self->frames = NULL;
++
++  g_print("Signal IMG Capture\n");
++  fpi_image_device_image_captured(img_dev, img);
++
++  // TRIED AND REVERTED: reporting the finger gone here makes the result surface
++  // while the finger is still down (libfprint has the match immediately, it
++  // only withholds *completion* until finger-off), moving the lift requirement
++  // onto the next acquisition's calibration guard. Conceptually the right split
++  // — but measured 4/6 true accept against 6/6 for waiting properly, because
++  // libfprint deactivates the moment finger-off is reported, tearing this SSM
++  // down before it finishes its FDT cycle and leaving the sensor in a worse
++  // state for the next run. Snappier feedback is not worth ~1/3 of the accuracy.
++  fpi_ssm_next_state(ssm);
+ }
+ 
+ gboolean save_image_to_pgm2(guchar *data, const char *path) {
+@@ -607,11 +860,36 @@ gboolean save_image_to_pgm(FpImage *img, const char *path) {
+ }
+ 
+ enum scan_empty_img_state {
++  SCAN_EMPTY_UPLOAD_CONFIG,
++  SCAN_EMPTY_FDT_BASELINE,
+   SCAN_EMPTY_GET_IMG,
+ 
+   SCAN_EMPTY_NUM,
+ };
+ 
++// The working Python capture (goodix-fp-dump) issues, INSIDE the active TLS
++// session and right before GET_IMAGE: upload_config_mcu(config) then
++// mcu_switch_to_fdt_mode(baseline 0x8000..). Without that the 55a4 firmware
++// answers GET_IMAGE with a protocol REQUEST_TLS_CONNECTION (0xd0) instead of
++// the encrypted frame. Replicate that preamble here.
++static const guint8 fdt_baseline_55X4[] = {
++    0x0d, 0x01, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00,
++    0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00};
++
++// A quiet plate barely changes between two frames; a finger resting, settling
++// or lifting moves this well past the threshold.
++#define GOODIX55X4_CAL_STABLE_DIFF 12.0
++// A clean plate confirms on the second frame, so the retry delay is pure
++// latency in front of every touch — keep it short. The scan cycle already waits
++// for lift-off, so this guard only has to cover the leftovers; ~2.4 s of total
++// headroom is plenty and it still terminates rather than hanging.
++#define GOODIX55X4_CAL_MAX_ATTEMPTS 16
++#define GOODIX55X4_CAL_RETRY_DELAY_MS 150
++
++static void retry_calibration(FpDevice *dev, gpointer user_data) {
++  fpi_ssm_jump_to_state(user_data, SCAN_EMPTY_GET_IMG);
++}
++
+ static void on_scan_empty_img(FpDevice *dev, guint8 *data, guint16 length,
+                               gpointer ssm, GError *error) {
+   if (error) {
+@@ -619,16 +897,132 @@ static void on_scan_empty_img(FpDevice *dev, guint8 *data, guint16 length,
+     return;
+   }
+   FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
+-  decode_frame(self->empty_img, data);
+-  // FpImage *bgk = fp_image_new(GOODIX55X4_WIDTH, GOODIX55X4_HEIGHT);
+-  // squash_frame(self->empty_img, bgk->data);
+-  // save_image_to_pgm(bgk, "./background.pgm");
++
++  Goodix55X4Pix candidate[GOODIX55X4_FRAME_SIZE];
++  decode_frame(candidate, data);
++
++  // Only accept a baseline the plate agrees on twice in a row. Otherwise a
++  // finger that is still down (or coming off) gets baked into the background,
++  // and every subsequent |frame - baseline| is measured against a phantom
++  // finger — which is what made lifting the finger look like a fresh touch.
++  if (self->cal_have_prev) {
++    double d = frame_diff_score(candidate, self->cal_prev);
++    if (d <= GOODIX55X4_CAL_STABLE_DIFF) {
++      memcpy(self->empty_img, candidate, sizeof(self->empty_img));
++      self->empty_img_valid = TRUE;
++      self->cal_have_prev = FALSE;
++      self->cal_attempts = 0;
++      g_print("Calibration: baseline accepted (stability %.1f)\n", d);
++      fpi_ssm_next_state(ssm);
++      return;
++    }
++    g_print("Calibration: plate not settled (%.1f), retrying — finger still on "
++            "the sensor?\n", d);
++  }
++
++  memcpy(self->cal_prev, candidate, sizeof(self->cal_prev));
++  self->cal_have_prev = TRUE;
++
++  if (++self->cal_attempts >= GOODIX55X4_CAL_MAX_ATTEMPTS) {
++    // Never hang on this: take what we have and let the scan proceed.
++    memcpy(self->empty_img, candidate, sizeof(self->empty_img));
++    self->empty_img_valid = TRUE;
++    self->cal_have_prev = FALSE;
++    self->cal_attempts = 0;
++    fp_warn("Calibration never settled; using the last baseline candidate");
++    fpi_ssm_next_state(ssm);
++    return;
++  }
++
++  fpi_device_add_timeout(dev, GOODIX55X4_CAL_RETRY_DELAY_MS, retry_calibration,
++                         ssm, NULL);
++}
++/**
++ * @brief Learn this sensor's finger-detect thresholds from an FDT reply.
++ *
++ * The device answers FDT commands with its currently measured per-zone base
++ * level (4 header bytes, then one LE uint16 per zone). The vendor driver turns
++ * those into the thresholds it sends back as base>>1; replicating that is what
++ * makes device-side finger detection work on this unit.
++ */
++static void learn_fdt_thresholds(FpiDeviceGoodixTls55X4 *self,
++                                 const guint8 *data, guint16 len) {
++  // Only for device ids flagged for it — see GOODIX_55X4_FLAG_LEARN_FDT.
++  if (!(fpi_device_get_driver_data(FP_DEVICE(self)) &
++        GOODIX_55X4_FLAG_LEARN_FDT))
++    return;
++
++  if (data == NULL ||
++      len < GOODIX55X4_FDT_REPLY_HDR + GOODIX55X4_FDT_ZONES * 2) {
++    g_print("FDT: reply too short (%u B), keeping previous thresholds\n", len);
++    return;
++  }
++
++  for (int i = 0; i != GOODIX55X4_FDT_ZONES; ++i) {
++    const guint8 *p = data + GOODIX55X4_FDT_REPLY_HDR + i * 2;
++    guint16 base = (guint16)p[0] | ((guint16)p[1] << 8);
++    guint thr = base >> 1;
++    // Masking would wrap silently: this unit reports bases of 352-410, so only
++    // ~20% of headroom separates it from base >= 512. Saturate and say so.
++    if (thr > 0xff) {
++      fp_warn("FDT zone %d base 0x%x exceeds the 8-bit threshold field", i, base);
++      thr = 0xff;
++    }
++    self->fdt_thresholds[i] = (guint8)thr;
++  }
++  self->fdt_thresholds_valid = TRUE;
++
++  g_print("FDT thresholds learned from sensor:");
++  for (int i = 0; i != GOODIX55X4_FDT_ZONES; ++i)
++    g_print(" %02x", self->fdt_thresholds[i]);
++  g_print("\n");
++}
++
++/**
++ * @brief Build an FDT command payload using the learned thresholds.
++ * @param kind 0x0c = wait-for-touch, 0x0d = mode/baseline, 0x0e = wait-for-lift
++ */
++static void build_fdt_payload(FpiDeviceGoodixTls55X4 *self, guint8 kind,
++                              guint8 out[GOODIX55X4_FDT_PAYLOAD_LEN]) {
++  out[0] = kind;
++  out[1] = 0x01;
++  for (int i = 0; i != GOODIX55X4_FDT_ZONES; ++i) {
++    out[2 + i * 2] = 0x80;
++    out[3 + i * 2] = self->fdt_thresholds[i];
++  }
++}
++
++static void check_fdt_baseline(FpDevice *dev, guint8 *data, guint16 len,
++                               gpointer ssm, GError *err) {
++  if (err) {
++    g_print("FDT BASELINE FAILED\n");
++    fpi_ssm_mark_failed(ssm, err);
++    return;
++  }
++  learn_fdt_thresholds(FPI_DEVICE_GOODIXTLS55X4(dev), data, len);
+   fpi_ssm_next_state(ssm);
+ }
++
+ static void scan_empty_run(FpiSsm *ssm, FpDevice *dev) {
+ 
+   switch (fpi_ssm_get_cur_state(ssm)) {
+ 
++  case SCAN_EMPTY_UPLOAD_CONFIG:
++    g_print("SCAN_EMPTY: upload config (in TLS)\n");
++    goodix_send_upload_config_mcu(dev, goodix_55x4_config,
++                                  sizeof(goodix_55x4_config), NULL,
++                                  check_config_upload, ssm);
++    break;
++
++  case SCAN_EMPTY_FDT_BASELINE:
++    g_print("SCAN_EMPTY: fdt baseline\n");
++    // Neutral (0x8000) probe: the reply carries this sensor's measured base,
++    // from which the real thresholds are derived.
++    goodix_send_mcu_switch_to_fdt_mode(dev, (guint8 *)fdt_baseline_55X4,
++                                       sizeof(fdt_baseline_55X4), NULL,
++                                       check_fdt_baseline, ssm);
++    break;
++
+   case SCAN_EMPTY_GET_IMG:
+     goodix_tls_read_image(dev, on_scan_empty_img, ssm);
+     break;
+@@ -665,23 +1059,50 @@ const guint8 fdt_switch_state_up_55X4[] = {
+ 
+ static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
+   FpImageDevice *img_dev = FP_IMAGE_DEVICE(dev);
++  FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
+ 
+   switch (fpi_ssm_get_cur_state(ssm)) {
+   case SCAN_STAGE_CALIBRATE:
+-    scan_empty_img(dev, ssm);
++    // Only once per activation — see empty_img_valid.
++    if (self->empty_img_valid) {
++      fpi_ssm_next_state(ssm);
++    } else {
++      scan_empty_img(dev, ssm);
++    }
++    break;
++  case SCAN_STAGE_LED_ON:
++    // Light the sensor while it waits for a finger: this is the moment the
++    // user must be told "touch now", and it is when the vendor driver lights
++    // it too.
++    goodix55x4_set_led(dev, TRUE, ssm);
+     break;
++
+   case SCAN_STAGE_SWITCH_TO_FDT_MODE:
+     g_print("SWITCH TO FDT MODE\n");
+-    goodix_send_mcu_switch_to_fdt_mode(
+-        dev, (guint8 *)fdt_switch_state_mode_55X4,
+-        sizeof(fdt_switch_state_mode_55X4), NULL, check_none_cmd, ssm);
++    if (self->fdt_thresholds_valid) {
++      guint8 payload[GOODIX55X4_FDT_PAYLOAD_LEN];
++      build_fdt_payload(self, 0x0d, payload);
++      goodix_send_mcu_switch_to_fdt_mode(dev, payload, sizeof(payload), NULL,
++                                         check_none_cmd, ssm);
++    } else {
++      goodix_send_mcu_switch_to_fdt_mode(
++          dev, (guint8 *)fdt_switch_state_mode_55X4,
++          sizeof(fdt_switch_state_mode_55X4), NULL, check_none_cmd, ssm);
++    }
+     break;
+ 
+   case SCAN_STAGE_SWITCH_TO_FDT_DOWN:
+     g_print("SWITCH TO FDT DOWN\n");
+-    goodix_send_mcu_switch_to_fdt_down(
+-        dev, (guint8 *)fdt_switch_state_down_55X4,
+-        sizeof(fdt_switch_state_down_55X4), NULL, check_none_cmd, ssm);
++    if (self->fdt_thresholds_valid) {
++      guint8 payload[GOODIX55X4_FDT_PAYLOAD_LEN];
++      build_fdt_payload(self, 0x0c, payload);
++      goodix_send_mcu_switch_to_fdt_down(dev, payload, sizeof(payload), NULL,
++                                         check_none_cmd, ssm);
++    } else {
++      goodix_send_mcu_switch_to_fdt_down(
++          dev, (guint8 *)fdt_switch_state_down_55X4,
++          sizeof(fdt_switch_state_down_55X4), NULL, check_none_cmd, ssm);
++    }
+     break;
+   case SCAN_STAGE_GET_IMG:
+     g_print("SWITCH TO GET IMAGE\n");
+@@ -696,21 +1117,45 @@ static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
+     break;
+   case SCAN_STAGE_SWITCH_TO_FDT_MODE2:
+     g_print("SWITCH TO FDT MODE 2\n");
+-    goodix_send_mcu_switch_to_fdt_mode(
+-        dev, (guint8 *)fdt_switch_state_mode2_55X4,
+-        sizeof(fdt_switch_state_mode2_55X4), NULL, check_none_cmd, ssm);
++    if (self->fdt_thresholds_valid) {
++      guint8 payload[GOODIX55X4_FDT_PAYLOAD_LEN];
++      build_fdt_payload(self, 0x0d, payload);
++      goodix_send_mcu_switch_to_fdt_mode(dev, payload, sizeof(payload), NULL,
++                                         check_none_cmd, ssm);
++    } else {
++      goodix_send_mcu_switch_to_fdt_mode(
++          dev, (guint8 *)fdt_switch_state_mode2_55X4,
++          sizeof(fdt_switch_state_mode2_55X4), NULL, check_none_cmd, ssm);
++    }
+     break;
+   case SCAN_STAGE_SWITCH_TO_FDT_UP_NO_REPLY:
+     g_print("SWITCH TO FDT UP NO REPLY\n");
+-    goodix_send_mcu_switch_to_fdt_up_no_reply(
+-        dev, (guint8 *)fdt_switch_state_up_55X4,
+-        sizeof(fdt_switch_state_up_55X4), NULL, check_none_cmd, ssm);
++    if (self->fdt_thresholds_valid) {
++      guint8 payload[GOODIX55X4_FDT_PAYLOAD_LEN];
++      build_fdt_payload(self, 0x0e, payload);
++      goodix_send_mcu_switch_to_fdt_up_no_reply(dev, payload, sizeof(payload),
++                                                NULL, check_none_cmd, ssm);
++    } else {
++      goodix_send_mcu_switch_to_fdt_up_no_reply(
++          dev, (guint8 *)fdt_switch_state_up_55X4,
++          sizeof(fdt_switch_state_up_55X4), NULL, check_none_cmd, ssm);
++    }
+     break;
+   case SCAN_STAGE_SWITCH_TO_FDT_UP:
+-    g_print("SWITCH TO FDT UP\n");
+-    goodix_send_mcu_switch_to_fdt_up(dev, (guint8 *)fdt_switch_state_up_55X4,
+-                                     sizeof(fdt_switch_state_up_55X4), NULL,
+-                                     check_none_cmd, ssm);
++    // Blocks on the device until the finger is actually lifted (the vendor
++    // driver spends most of its time here). Waiting for lift is also what
++    // keeps the next calibration baseline free of finger residue.
++    g_print("SWITCH TO FDT UP (waiting for finger lift)\n");
++    if (self->fdt_thresholds_valid) {
++      guint8 payload[GOODIX55X4_FDT_PAYLOAD_LEN];
++      build_fdt_payload(self, 0x0e, payload);
++      goodix_send_mcu_switch_to_fdt_up(dev, payload, sizeof(payload), NULL,
++                                       check_none_cmd, ssm);
++    } else {
++      goodix_send_mcu_switch_to_fdt_up(dev, (guint8 *)fdt_switch_state_up_55X4,
++                                       sizeof(fdt_switch_state_up_55X4), NULL,
++                                       check_none_cmd, ssm);
++    }
+     break;
+   case SCAN_STAGE_SWITCH_TO_FDT_DONE:
+     fpi_image_device_report_finger_status(img_dev, FALSE);
+@@ -772,6 +1217,7 @@ static void sleep_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
+ }
+ 
+ static void scan_start(FpiDeviceGoodixTls55X4 *dev) {
++  dev->poll_attempts = 0;
+   fpi_ssm_start(fpi_ssm_new(FP_DEVICE(dev), scan_run_state, SCAN_STAGE_NUM),
+                 scan_complete);
+ }
+@@ -787,6 +1233,7 @@ static void sleep_start(FpDevice *dev, gpointer user_data) {
+ 
+ static void dev_init(FpImageDevice *img_dev) {
+   FpDevice *dev = FP_DEVICE(img_dev);
++  FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
+   GError *error = NULL;
+ 
+   if (goodix_dev_init(dev, &error)) {
+@@ -794,6 +1241,13 @@ static void dev_init(FpImageDevice *img_dev) {
+     return;
+   }
+ 
++  // Start from a known-dark sensor. Clearing the light on close is not enough
++  // on its own: a killed or crashed fprintd never reaches close, and the sensor
++  // then sits lit with nobody left to switch it off. Cached state is reset too,
++  // since the light may have survived from a previous process.
++  self->led_is_on = TRUE;   // force the switch to be actually sent
++  goodix55x4_set_led(dev, FALSE, NULL);
++
+   fpi_image_device_open_complete(img_dev, NULL);
+ }
+ 
+@@ -801,6 +1255,16 @@ static void dev_deinit(FpImageDevice *img_dev) {
+   FpDevice *dev = FP_DEVICE(img_dev);
+   GError *error = NULL;
+ 
++  // Clear the light here rather than on deactivate. Every verify attempt is a
++  // full activate/deactivate cycle driven from above, so switching it off there
++  // made it blink between a failed attempt and the retry that follows. The
++  // device stays *open* across those retries and is only closed once the system
++  // is genuinely done with the sensor — which is the lifetime the light should
++  // track. The write itself is synchronous, so it lands before the interface is
++  // released below.
++  goodix_reset_state(dev);
++  goodix55x4_set_led(dev, FALSE, NULL);
++
+   if (goodix_dev_deinit(dev, &error)) {
+     fpi_image_device_close_complete(img_dev, error);
+     return;
+@@ -838,7 +1302,7 @@ static void dev_deactivate(FpImageDevice *img_dev) {
+ // ---- DEV SECTION END ----
+ 
+ static void fpi_device_goodixtls55x4_init(FpiDeviceGoodixTls55X4 *self) {
+-  self->frames = g_slist_alloc();
++  self->frames = NULL;
+ }
+ 
+ static void
+@@ -855,7 +1319,11 @@ fpi_device_goodixtls55x4_class_init(FpiDeviceGoodixTls55X4Class *class) {
+   dev_class->full_name = "Goodix TLS Fingerprint Sensor 55X4";
+   dev_class->type = FP_DEVICE_TYPE_USB;
+   dev_class->id_table = id_table;
+-  dev_class->nr_enroll_stages = 10;
++  // Each stage stores one template, and on a sensor this small a template only
++  // covers a narrow patch of the finger — displacement beyond that patch is
++  // what fails to match. More stages = wider covered area = tolerance to the
++  // finger landing off-centre.
++  dev_class->nr_enroll_stages = 16;
+   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+ 
+   // TODO
+diff --git a/libfprint/drivers/goodixtls/goodix55x4.h b/libfprint/drivers/goodixtls/goodix55x4.h
+index ccbcfaa..d916bf6 100644
+--- a/libfprint/drivers/goodixtls/goodix55x4.h
++++ b/libfprint/drivers/goodixtls/goodix55x4.h
+@@ -24,7 +24,7 @@
+ #define GOODIX_55X4_EP_IN (0x82 | FPI_USB_ENDPOINT_IN)
+ #define GOODIX_55X4_EP_OUT (0x1 | FPI_USB_ENDPOINT_OUT)
+ 
+-#define GOODIX_55X4_FIRMWARE_VERSION ("GF3268_RTSEC_APP_10041")
++#define GOODIX_55X4_FIRMWARE_VERSION ("GF3268_RTSEC_APP_10063")
+ 
+ #define GOODIX_55X4_PSK_FLAGS (0xbb020007)
+ 
+@@ -63,9 +63,18 @@ guint8 goodix_55x4_config[] = {
+     0x00, 0x9a, 0x69
+ };
+ 
++// Per-zone finger-detect thresholds are derived at runtime from the base level
++// the sensor reports (see learn_fdt_thresholds). That is verified on the 55a4
++// only. The 55b4 ships three DIFFERENT hardcoded tables here — MODE, DOWN and
++// UP are not the same set, and UP sits well below the other two — so feeding it
++// one learned set would raise its UP threshold by roughly a third, and a UP
++// that never fires is an unbounded wait after every successful capture. Leave
++// working 55b4 units on their tables until someone can measure one.
++#define GOODIX_55X4_FLAG_LEARN_FDT (1 << 0)
++
+ static const FpIdEntry id_table[] = {
+-    {.vid = 0x27c6, .pid = 0x55b4},
+-    {.vid = 0x27c6, .pid = 0x55a4},
++    {.vid = 0x27c6, .pid = 0x55b4, .driver_data = 0},
++    {.vid = 0x27c6, .pid = 0x55a4, .driver_data = GOODIX_55X4_FLAG_LEARN_FDT},
+     {.vid = 0, .pid = 0, .driver_data = 0},
+ };
+ 
+diff --git a/libfprint/drivers/goodixtls/goodixtls.c b/libfprint/drivers/goodixtls/goodixtls.c
+index 60eccc1..68c2b36 100644
+--- a/libfprint/drivers/goodixtls/goodixtls.c
++++ b/libfprint/drivers/goodixtls/goodixtls.c
+@@ -92,7 +92,7 @@ static void tls_server_config_ctx(SSL_CTX* ctx)
+ {
+     SSL_CTX_set_ecdh_auto(ctx, 1);
+     SSL_CTX_set_dh_auto(ctx, 1);
+-    SSL_CTX_set_cipher_list(ctx, "ALL");
++    SSL_CTX_set_cipher_list(ctx, "PSK:@SECLEVEL=0");
+     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+     SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+     SSL_CTX_set_psk_server_callback(ctx, tls_server_psk_server_callback);
+@@ -121,7 +121,7 @@ static void tls_config_ssl(SSL* ssl)
+     SSL_set_min_proto_version(ssl, TLS1_2_VERSION);
+     SSL_set_max_proto_version(ssl, TLS1_2_VERSION);
+     SSL_set_psk_server_callback(ssl, tls_server_psk_server_callback);
+-    SSL_set_cipher_list(ssl, "ALL");
++    SSL_set_cipher_list(ssl, "PSK:@SECLEVEL=0");
+ }
+ 
+ 
+diff --git a/libfprint/sigfm/sigfm.cpp b/libfprint/sigfm/sigfm.cpp
+index a5e1cdc..4e47662 100644
+--- a/libfprint/sigfm/sigfm.cpp
++++ b/libfprint/sigfm/sigfm.cpp
+@@ -27,6 +27,7 @@
+ #include "opencv2/features2d.hpp"
+ #include "opencv2/imgcodecs.hpp"
+ #include <algorithm>
++#include <cmath>
+ #include <cstdio>
+ #include <filesystem>
+ #include <fstream>
+@@ -62,6 +63,10 @@ namespace {
+ constexpr auto distance_match = 0.75;
+ constexpr auto length_match = 0.05;
+ constexpr auto angle_match = 0.05;
++// Absolute angular tolerance in radians (~5.7 deg) for the pairwise rotation
++// consistency test. Uniform across the circle, unlike the relative test it
++// replaces — see the comment at its use site.
++constexpr auto angle_tol_rad = 0.10;
+ constexpr auto min_match = 5;
+ struct match {
+     cv::Point2i p1;
+@@ -74,8 +79,14 @@ struct match {
+     }
+     bool operator<(const match& right) const
+     {
+-        return (this->p1.y < right.p1.y) ||
+-               ((this->p1.y < right.p1.y) && this->p1.x < right.p1.x);
++        // NOTE: this used to read `(a.y < b.y) || ((a.y < b.y) && a.x < b.x)`,
++        // which is just `a.y < b.y` — a strict weak ordering on the Y
++        // coordinate alone. std::set therefore treated every pair of matches
++        // sharing a p1.y as duplicates and silently dropped all but one,
++        // discarding a large fraction of genuine matches. Order on the full
++        // tuple so only true duplicates collapse.
++        return std::tie(this->p1.y, this->p1.x, this->p2.y, this->p2.x) <
++               std::tie(right.p1.y, right.p1.x, right.p2.y, right.p2.x);
+     }
+ };
+ struct angle {
+@@ -173,12 +184,21 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
+                     length_match) {
+ 
+                     double product = length_1 * length_2;
++                    // asin()/acos() return NaN as soon as rounding pushes the
++                    // normalised dot/cross product a hair outside [-1, 1] —
++                    // which is exactly what happens for near-parallel vectors,
++                    // i.e. the zero-rotation case of a finger placed the same
++                    // way twice. Every later comparison against a NaN is false,
++                    // so the best-aligned pairs were being thrown away. Clamp.
++                    auto clamp1 = [](double v) {
++                        return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v);
++                    };
+                     angles.emplace_back(angle(
+                         M_PI / 2 +
+-                            asin((vec_1[0] * vec_2[0] + vec_1[1] * vec_2[1]) /
+-                                 product),
+-                        acos((vec_1[0] * vec_2[1] - vec_1[1] * vec_2[0]) /
+-                             product),
++                            asin(clamp1((vec_1[0] * vec_2[0] +
++                                         vec_1[1] * vec_2[1]) / product)),
++                        acos(clamp1((vec_1[0] * vec_2[1] -
++                                     vec_1[1] * vec_2[0]) / product)),
+                         match_1, match_2));
+                 }
+             }
+@@ -194,12 +214,20 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
+             for (std::size_t k = j + 1; k < angles.size(); k++) {
+                 angle angle_2 = angles[k];
+ 
+-                if (1 - std::min(angle_1.sin, angle_2.sin) /
+-                                std::max(angle_1.sin, angle_2.sin) <=
+-                        angle_match &&
+-                    1 - std::min(angle_1.cos, angle_2.cos) /
+-                                std::max(angle_1.cos, angle_2.cos) <=
+-                        angle_match) {
++                // These two fields are ANGLES (radians), so they must be
++                // compared by absolute difference. The original code used a
++                // RELATIVE difference, `1 - min/max <= 0.05`, which is broken
++                // for angles in two ways:
++                //  - the effective tolerance depends on where on the circle
++                //    you are: ~0.15 deg near zero, ~9 deg near pi;
++                //  - it degenerates exactly at a quarter-turn: one field is
++                //    acos(sin(theta)), which is 0 at theta = 90 deg, so the
++                //    test becomes 0/0 = NaN and every comparison is false.
++                //    A perfectly consistent 90-degree rotation was therefore
++                //    always rejected, and rotated presses only ever matched by
++                //    luck.
++                if (std::fabs(angle_1.sin - angle_2.sin) <= angle_tol_rad &&
++                    std::fabs(angle_1.cos - angle_2.cos) <= angle_tol_rad) {
+ 
+                     count += 1;
+                 }

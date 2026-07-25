@@ -1,0 +1,29 @@
+module goodix_fprintd 1.0;
+
+# Our libfprint links OpenCV (SIGFM matcher), which pulls in Intel TBB; TBB's
+# scalable allocator reads /proc/sys/vm/nr_hugepages when it initialises and
+# falls back to normal pages when it can't. Under fprintd's SELinux domain that
+# read is denied, once per fprintd start:
+#
+#   avc: denied { read } for comm="fprintd" name="nr_hugepages"
+#        scontext=system_u:system_r:fprintd_t:s0
+#        tcontext=system_u:object_r:sysctl_vm_t:s0 tclass=file
+#
+# Nothing breaks, but on Fedora setroubleshoot turns it into a desktop alert.
+# Note what dontaudit does: it stops the denial being logged. It grants fprintd
+# no access — the read still fails and TBB still falls back.
+#
+# scripts/install-system.sh loads this when SELinux is enforcing, and
+# scripts/uninstall-system.sh removes it. By hand:
+#   checkmodule -M -m -o goodix_fprintd.mod goodix_fprintd.te
+#   semodule_package -o goodix_fprintd.pp -m goodix_fprintd.mod
+#   sudo semodule -i goodix_fprintd.pp      # undo: sudo semodule -r goodix_fprintd
+# To see suppressed denials again while debugging: semodule -DB (restore: -B).
+
+require {
+    type fprintd_t;
+    type sysctl_vm_t;
+    class file read;
+}
+
+dontaudit fprintd_t sysctl_vm_t:file read;
