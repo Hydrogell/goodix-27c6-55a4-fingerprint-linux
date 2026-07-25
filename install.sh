@@ -64,7 +64,13 @@ done
 BUILD="$(mktemp -d -p "${GOODIX_BUILD_DIR:-/var/tmp}" goodix55a4.XXXXXXXX)"
 cleanup() {
   echo "== cleaning up the build tree =="
-  rm -rf "$BUILD"
+  rm -rf "$BUILD" 2>/dev/null
+  # Verify rather than assume: the install step runs as root inside $BUILD, so a
+  # root-owned file left behind would defeat the whole point of building here.
+  if [ -e "$BUILD" ]; then
+    echo "WARNING: $BUILD could not be removed completely." >&2
+    echo "         Remove it with:  sudo rm -rf $BUILD" >&2
+  fi
 }
 trap cleanup EXIT
 echo "building in $BUILD (removed when this finishes)"

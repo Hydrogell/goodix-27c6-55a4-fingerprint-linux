@@ -59,7 +59,11 @@ sleep 1
 PYBIN="${FP_PYBIN:-$PYDIR/.venv/bin/python}"
 if [ -x "$PYBIN" ]; then
   install -m0644 "$REPO/scripts/provision_psk.py" "$PYDIR/"
-  ( cd "$PYDIR" && "$PYBIN" provision_psk.py ) || {
+  # PYTHONDONTWRITEBYTECODE: we are root here, and $PYDIR may be a throwaway
+  # directory owned by the user (that is how install.sh calls us). A root-owned
+  # __pycache__ inside it survives the user's cleanup, so the "leaves nothing
+  # behind" promise quietly breaks. Simplest fix is to write no bytecode at all.
+  ( cd "$PYDIR" && PYTHONDONTWRITEBYTECODE=1 "$PYBIN" provision_psk.py ) || {
       echo "   WARNING: key provisioning failed — the driver may not activate." >&2
       echo "   retry: cd $PYDIR && .venv/bin/python provision_psk.py" >&2
   }
