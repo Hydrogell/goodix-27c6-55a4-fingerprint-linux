@@ -3,10 +3,12 @@
 A working libfprint driver for the **Goodix 55a4** fingerprint sensor, as found
 in the Lenovo ThinkBook 15 G2 ITL and other machines of that generation.
 
-This sensor has no working open-source driver anywhere: both the AUR package
-`libfprint-goodixtls-55x4` and the Fedora COPR `d-k-bo/libfprint-goodixtls`
-state that they support the 55b4 and that "55a4 will be added later". This
-repository is that later.
+As of July 2026, no working open-source driver for the 55a4 was publicly
+available: both the AUR package `libfprint-goodixtls-55x4` and the Fedora COPR
+`d-k-bo/libfprint-goodixtls` support the 55b4 and say that "55a4 will be added
+later". This repository is that later. If a maintained driver has appeared since
+— check those two first — it is probably the better starting point, and the
+protocol notes here still apply.
 
 It is a patch on top of [TheWeirdDev/libfprint][fork] branch
 `55b4-experimental`, plus the scripts to build, install and test it.

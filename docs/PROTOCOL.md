@@ -1,9 +1,26 @@
 # Goodix 55x4 protocol notes
 
-Protocol behaviour of the 27c6:55a4, established by observing USB traffic on the
-author's own hardware and verified against the device itself. Written separately
-from the driver because these are protocol facts, useful to anyone working on
-this sensor family regardless of what they are building.
+Protocol behaviour of the 27c6:55a4. Written separately from the driver because
+these are protocol facts, useful to anyone working on this sensor family
+regardless of what they are building.
+
+**Where this comes from**, since this file is meant to be read on its own. Three
+sources, all on the author's own hardware:
+
+1. USB traffic, captured with `usbmon` while the stock Windows driver drove the
+   sensor. Command sequences, timings and threshold values come from here.
+2. Values the device reports in its own replies — the FDT baselines that the
+   `base >> 1` rule is derived from, for instance.
+3. The vendor's Windows driver itself, examined for interoperability. A few
+   facts below cannot be seen on the wire: the quoted branch strings
+   (`"image base not valid, wait fdt up"`) and the frame-selection rule. Those
+   were read out of the shipped binary to work out *why* the sensor behaves as
+   it does, then re-implemented independently.
+
+No vendor code, structure or data was copied into this project. Studying an
+interface in order to write something that can talk to it is permitted for that
+purpose in the EU (Directive 2009/24/EC, Art. 6) and in the US (17 U.S.C.
+§1201(f)); the README has the full account.
 
 The framing itself (`a0`-packets, command/ACK structure, TLS-PSK setup) is
 already documented by [goodix-fp-dump][gfd] and [goodix-wireshark][gws]; only

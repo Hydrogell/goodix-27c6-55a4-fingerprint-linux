@@ -2,9 +2,12 @@
 
 How this driver went from matching about one press in three to matching
 reliably, and what each defect actually was. Written as a record of evidence:
-every claim below was either measured on hardware or read out of a USB capture
-of the vendor driver. Protocol facts on their own are in
-[PROTOCOL.md](PROTOCOL.md).
+every claim below was measured on hardware, read out of a USB capture of the
+stock driver in operation, or — for the few facts the wire cannot show, such as
+the vendor branch strings quoted later — read out of the vendor's Windows driver,
+examined for interoperability and re-implemented independently. No vendor code
+was copied; see the README for the full provenance account. Protocol facts on
+their own are in [PROTOCOL.md](PROTOCOL.md).
 
 Live checkouts go under `work/` (gitignored) and are rebuilt by `./setup.sh`.
 
