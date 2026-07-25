@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - run: shellcheck --severity=warning install.sh setup.sh scripts/*.sh scripts/research/*.sh
+
+  python:
+    name: python syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m compileall -q scripts
+
+  patch:
+    name: patch applies to the pinned base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Read the pin out of install.sh rather than repeating it here, so this
+      # check can never drift away from what users actually build.
+      - name: extract the pinned revision
+        id: pin
+        run: |
+          rev=$(grep -oE 'FORK_REV="[0-9a-f]{40}"' install.sh | grep -oE '[0-9a-f]{40}')
+          test -n "$rev" || { echo "no 40-char FORK_REV found in install.sh" >&2; exit 1; }
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - name: clone the base at that revision
+        env:
+          # Via env, not inline ${{ }}: values must never reach the shell as
+          # code. (The regex above already restricts this to 40 hex characters,
+          # but the habit is what keeps the next workflow safe.)
+          REV: ${{ steps.pin.outputs.rev }}
+        run: |
+          git clone -q --branch 55b4-experimental \
+            https://github.com/TheWeirdDev/libfprint.git /tmp/base
+          git -C /tmp/base checkout -q "$REV"
+          got=$(git -C /tmp/base rev-parse HEAD)
+          test "$got" = "$REV" || { echo "base is at $got" >&2; exit 1; }
+
+      # This is the check that matters: editing the driver source and forgetting
+      # to regenerate the patch, or an upstream change, both surface here.
+      - name: git apply --check
+        run: git -C /tmp/base apply --check "$GITHUB_WORKSPACE/patches/55a4-driver.patch"
+
+  build:
+    name: build on Fedora
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      # git first: actions/checkout needs it, and the container has no toolchain.
+      - name: build dependencies
+        run: |
+          dnf install -y -q git meson ninja-build gcc gcc-c++ cmake \
+            libgusb-devel nss-devel openssl-devel cairo-devel glib2-devel \
+            opencv-devel gobject-introspection-devel libgudev-devel \
+            pixman-devel doctest-devel
+
+      - uses: actions/checkout@v4
+
+      - name: apply the patch and compile
+        run: |
+          rev=$(grep -oE 'FORK_REV="[0-9a-f]{40}"' install.sh | grep -oE '[0-9a-f]{40}')
+          git clone -q --branch 55b4-experimental \
+            https://github.com/TheWeirdDev/libfprint.git /tmp/base
+          git -C /tmp/base checkout -q "$rev"
+          git -C /tmp/base apply "$GITHUB_WORKSPACE/patches/55a4-driver.patch"
+          cd /tmp/base
+          meson setup _build -Ddrivers=goodixtls55x4 -Dintrospection=false -Ddoc=false
+          ninja -C _build
+          test -f _build/libfprint/libfprint-2.so.2.0.0
+
+  privacy:
+    name: no captured data in the tree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A trace or frame dump of this sensor is a fingerprint image, and the
+      # pre-shared key protecting it is public. .gitignore is the first net;
+      # this is the second, because a `git add -f` bypasses the first.
+      - name: reject captures, frame dumps and device snapshots
+        run: |
+          if git ls-files | grep -iE '\.(pcapng|pcap|pgm|raw)$|(^|/)otp\.bin$'; then
+            echo "::error::A capture or frame dump is tracked. See CONTRIBUTING.md." >&2
+            exit 1
+          fi
+          echo "clean"

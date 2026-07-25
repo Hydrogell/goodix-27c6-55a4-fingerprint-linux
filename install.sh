@@ -21,10 +21,25 @@
 set -e
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
+# Full 40-character commit IDs on purpose, not abbreviations. A 7-character
+# prefix is 28 bits: anyone able to push to those repositories could add a commit
+# sharing it and make the checkout ambiguous. The libfprint pin matters for a
+# second reason too — the patch's context hunks apply only to that revision, and
+# a branch tip moves.
 FORK_URL="https://github.com/TheWeirdDev/libfprint.git"
-FORK_REV="d1ca62a"          # the patch's context hunks apply only to this
+FORK_REV="d1ca62a801aa565e67d1a2a47aaa7a33232b7990"
 DUMP_URL="https://github.com/goodix-fp-linux-dev/goodix-fp-dump.git"
-DUMP_REV="cc43bb3"
+DUMP_REV="cc43bb3b3154a0bccc0412ae024013c7e1923139"
+
+# Check out an exact commit and refuse to continue if we did not land on it.
+pin() {  # pin <dir> <full-sha>
+  git -C "$1" checkout -q "$2"
+  got="$(git -C "$1" rev-parse HEAD)"
+  [ "$got" = "$2" ] || {
+    echo "ERROR: $1 is at $got, expected $2 — refusing to build." >&2
+    exit 1
+  }
+}
 
 if [ "$(id -u)" -eq 0 ]; then
   echo "Run this as your normal user, not with sudo." >&2
@@ -56,7 +71,7 @@ echo "building in $BUILD (removed when this finishes)"
 
 echo "== 1/3 build the patched libfprint =="
 git clone -q --branch 55b4-experimental "$FORK_URL" "$BUILD/libfprint"
-( cd "$BUILD/libfprint" && git checkout -q "$FORK_REV" )
+pin "$BUILD/libfprint" "$FORK_REV"
 git -C "$BUILD/libfprint" apply "$REPO/patches/55a4-driver.patch"
 ( cd "$BUILD/libfprint" \
   && meson setup _build -Ddrivers=goodixtls55x4 -Dintrospection=false \
@@ -71,9 +86,12 @@ echo "   built"
 # ~250 MB. The research tooling in ./setup.sh does pull those in.
 echo "== 2/3 prepare one-time key provisioning =="
 git clone -q "$DUMP_URL" "$BUILD/goodix-fp-dump"
-( cd "$BUILD/goodix-fp-dump" && git checkout -q "$DUMP_REV" )
+pin "$BUILD/goodix-fp-dump" "$DUMP_REV"
 python3 -m venv "$BUILD/goodix-fp-dump/.venv"
 "$BUILD/goodix-fp-dump/.venv/bin/pip" install -q pyusb crcmod python-periphery
+# stub: protocol.py imports spidev unconditionally, for the SPI variants of this
+# sensor family. Ours is USB, so nothing ever calls into it — but the import has
+# to resolve or driver_55x4 will not load.
 printf 'class SpiDev:\n    pass\n' > "$BUILD/goodix-fp-dump/spidev.py"
 install -m0644 "$REPO/scripts/provision_psk.py" "$BUILD/goodix-fp-dump/"
 echo "   ready"

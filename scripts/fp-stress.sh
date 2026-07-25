@@ -62,7 +62,7 @@ trial() {  # trial <press> <verify_against> <expect: match|nomatch>
     n+=1
     if [ "$expect" = match ]; then hint="must MATCH"; else hint="must REJECT"; fi
 
-    pop critical "👆 Place: $pn finger" "trial $n of $TOTAL · verify against "$an" · $hint"
+    pop critical "👆 Place: $pn finger" "trial $n of $TOTAL · verify against \"$an\" · $hint"
     canberra-gtk-play -i message >/dev/null 2>&1 &
     printf '\n\033[1;33m>>> PLACE: %s FINGER\033[0m  (trial %d/%d, verify against "%s", %s)\n' \
         "$pn" "$n" "$TOTAL" "$an" "$hint"

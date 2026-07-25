@@ -41,6 +41,10 @@ run_capture () {  # $1=label  $2...=command (run as RUSER)
   local tpid=$!
   sleep 1.5
   echo "[cap] running: $*"
+  # The redirect is opened by root, not by $RUSER — which is what we want here,
+  # since $OUT may not be writable by the user yet; both files are chowned back
+  # at the end. shellcheck flags this pattern because it is usually a mistake.
+  # shellcheck disable=SC2024
   sudo -u "$RUSER" -- "$@" >"$OUT/cdiff-${label}.log" 2>&1 || true
   sleep 1.0
   kill "$tpid" 2>/dev/null || true

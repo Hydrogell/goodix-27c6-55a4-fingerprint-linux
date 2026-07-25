@@ -17,7 +17,6 @@ set -u
 
 MODE="${1:-verify}"
 COUNT="${2:-1}"
-SYNC_HINT=(-h string:x-canonical-private-synchronous:goodix-fp)
 
 note() {  # note <urgency> <title> <body>
     # No replace-id / sync hint: KDE stops displaying updates that reuse an id
@@ -109,7 +108,7 @@ run_enroll() {
         *enroll-failed*|*enroll-duplicate*)
             bad_msg "enrolment failed"
             ;;
-        *retry*|*remove-and-retry*)
+        *retry*)   # covers remove-and-retry, enroll-retry-scan, …
             note normal "↻ Again" "lift your finger and place it again"; ding message
             ;;
         esac

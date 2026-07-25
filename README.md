@@ -78,8 +78,10 @@ trials, which is not reachable by hand.
 
 ## Install
 
-Fedora is what this was developed and tested on. Other distributions should work
-but nobody has tried.
+Developed and tested on **Fedora 44**, against `fprintd` 1.94.5 and the distro's
+own `libfprint` 1.94.10, kernel 7.1, Python 3.14. Nothing here is version-specific
+in principle, and other distributions should work — but nobody has tried, so if
+you are the first, a report either way is welcome.
 
 Build dependencies first:
 
@@ -122,6 +124,9 @@ about 300 MB under `work/` — so you can edit and rebuild:
 ./setup.sh                              # keeps ./work/
 sudo bash scripts/install-system.sh     # installs whatever is in ./work/
 ```
+
+`scripts/led_gui.py` additionally needs Tk, which is not pulled in by the build
+dependencies above: `sudo dnf install python3-tkinter`.
 
 `scripts/fp-notify.sh` and `scripts/fp-stress.sh` wrap enrol and verify with
 desktop notifications that tell you exactly when to press and what the result
