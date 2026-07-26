@@ -1,5 +1,5 @@
 diff --git a/libfprint/drivers/goodixtls/goodix.c b/libfprint/drivers/goodixtls/goodix.c
-index 417a37c..5a68810 100644
+index 417a37c..56bc3d9 100644
 --- a/libfprint/drivers/goodixtls/goodix.c
 +++ b/libfprint/drivers/goodixtls/goodix.c
 @@ -56,6 +56,18 @@ typedef struct
@@ -255,7 +255,21 @@ index 417a37c..5a68810 100644
  }
  
  void
-@@ -1354,6 +1478,10 @@ goodix_read_tls (FpDevice *dev, GoodixTlsCallback callback,
+@@ -1322,8 +1446,11 @@ goodix_dev_deinit (FpDevice *dev, GError **error)
+   FpiDeviceGoodixTlsPrivate *priv =
+     fpi_device_goodixtls_get_instance_private (self);
+ 
+-  if (priv->timeout)
+-    g_source_destroy (priv->timeout);
++  // g_clear_pointer, not a bare g_source_destroy: goodix_reset_state () below
++  // destroys priv->timeout too, and left non-NULL here it is destroyed twice.
++  // GLib catches that as "g_source_destroy: assertion 'ref_count > 0' failed"
++  // on every close that had a command in flight.
++  g_clear_pointer (&priv->timeout, g_source_destroy);
+   g_free (priv->data);
+   g_cancellable_cancel (priv->transfer_cancel_tkn);
+   goodix_shutdown_tls (dev, error);
+@@ -1354,6 +1481,10 @@ goodix_read_tls (FpDevice *dev, GoodixTlsCallback callback,
    priv->user_data = user_data;
    priv->reply = TRUE;
    priv->cmd = 0;
@@ -266,7 +280,7 @@ index 417a37c..5a68810 100644
  }
  
  enum tls_states {
-@@ -1490,6 +1618,12 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
+@@ -1490,6 +1621,12 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
            fpi_ssm_mark_failed (ssm, err);
            return;
          }
@@ -280,10 +294,10 @@ index 417a37c..5a68810 100644
      }
  }
 diff --git a/libfprint/drivers/goodixtls/goodix55x4.c b/libfprint/drivers/goodixtls/goodix55x4.c
-index 20db582..06d29da 100644
+index 20db582..9e94b74 100644
 --- a/libfprint/drivers/goodixtls/goodix55x4.c
 +++ b/libfprint/drivers/goodixtls/goodix55x4.c
-@@ -51,7 +51,55 @@
+@@ -51,16 +51,116 @@
  // extra end
  #define GOODIX55X4_RAW_FRAME_SIZE                                              \
    (GOODIX55X4_HEIGHT * GOODIX55X4_SCAN_WIDTH) / 4 * 6
@@ -340,7 +354,17 @@ index 20db582..06d29da 100644
  
  typedef unsigned short Goodix55X4Pix;
  
-@@ -61,6 +109,40 @@ struct _FpiDeviceGoodixTls55X4 {
++// UNKNOWN is deliberately zero, so a freshly allocated device starts out not
++// trusting anything about the light.
++typedef enum {
++  GOODIX55X4_LED_UNKNOWN = 0,
++  GOODIX55X4_LED_OFF,
++  GOODIX55X4_LED_ON,
++} Goodix55X4LedState;
++
+ struct _FpiDeviceGoodixTls55X4 {
+   FpiDeviceGoodixTls parent;
+ 
    guint8 *otp;
  
    GSList *frames;
@@ -369,11 +393,21 @@ index 20db582..06d29da 100644
 +  gboolean cal_have_prev;
 +  guint cal_attempts;
 +
-+  // Current LED state, so the switch command is only sent on an actual change.
-+  // The scan SSM restarts on every retry and on every enrollment stage, and
-+  // re-sending "on" each time made the light blink off and on again instead of
-+  // staying lit for as long as the system is asking for a finger.
-+  gboolean led_is_on;
++  // Cached LED state, so the switch is only sent on an actual change: the scan
++  // SSM restarts on every retry and every enrollment stage, and re-sending "on"
++  // each time made the light blink instead of staying lit while the system asks
++  // for a finger.
++  //
++  // Three values, and the third one is the whole point. A two-valued cache turns
++  // any unacknowledged command into a permanent lie, and the "already in that
++  // state" shortcut then guarantees the light is never switched again. That is
++  // reachable: goodix.c drops a reply whose command byte does not match the
++  // pending one ("Invalid protocol command: 0x%02x") and returns without calling
++  // anyone back, so a late 0xae reply leaves the callback unfired. It is what
++  // left the sensor lit with fprintd already gone. UNKNOWN is therefore the
++  // state during flight and after any failure, and only an acknowledgement
++  // resolves it.
++  Goodix55X4LedState led_state;
 +  gboolean led_want_on;
 +
 +  // Effective touch threshold; see GOODIX55X4_TOUCH_DIFF.
@@ -381,7 +415,7 @@ index 20db582..06d29da 100644
  
    Goodix55X4Pix empty_img[GOODIX55X4_FRAME_SIZE];
  };
-@@ -71,7 +153,18 @@ G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4, FPI,
+@@ -71,7 +171,18 @@ G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4, FPI,
  G_DEFINE_TYPE(FpiDeviceGoodixTls55X4, fpi_device_goodixtls55x4,
                FPI_TYPE_DEVICE_GOODIXTLS);
  
@@ -401,7 +435,7 @@ index 20db582..06d29da 100644
  
  // ---- ACTIVE SECTION START ----
  
-@@ -106,7 +199,12 @@ static void check_firmware_version(FpDevice *dev, gchar *firmware,
+@@ -106,7 +217,12 @@ static void check_firmware_version(FpDevice *dev, gchar *firmware,
    fp_dbg("Device firmware: \"%s\"", firmware);
    g_print("%s\n", firmware);
  
@@ -415,7 +449,7 @@ index 20db582..06d29da 100644
      g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                  "Invalid device firmware: \"%s\"", firmware);
      fpi_ssm_mark_failed(user_data, error);
-@@ -340,6 +438,10 @@ static void activate_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
+@@ -340,6 +456,10 @@ static void activate_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
  
  enum SCAN_STAGES {
    SCAN_STAGE_CALIBRATE,
@@ -426,7 +460,7 @@ index 20db582..06d29da 100644
    SCAN_STAGE_SWITCH_TO_FDT_MODE,
    SCAN_STAGE_SWITCH_TO_FDT_DOWN,
    SCAN_STAGE_GET_IMG,
-@@ -348,11 +450,17 @@ enum SCAN_STAGES {
+@@ -348,11 +468,17 @@ enum SCAN_STAGES {
    SCAN_STAGE_SWITCH_TO_FDT_UP,
  //  SCAN_STAGE_SWITCH_TO_SLEEP_MODE,
  //  SCAN_STAGE_SWITCH_TO_SLEEP_MODE_REALTEK,
@@ -444,7 +478,7 @@ index 20db582..06d29da 100644
    SLEEP_STAGE_SWITCH_TO_SLEEP_MODE,
    SLEEP_STAGE_SWITCH_TO_SLEEP_MODE_REALTEK,
    SLEEP_STAGE_DEACTIVATE,
-@@ -360,6 +468,61 @@ enum SLEEP_STAGES {
+@@ -360,6 +486,83 @@ enum SLEEP_STAGES {
  };
  
  
@@ -469,11 +503,14 @@ index 20db582..06d29da 100644
 +
 +  if (error) {
 +    // The light is cosmetic; it must never be able to fail an authentication.
++    // Leave the state UNKNOWN so the next switch is actually sent.
 +    fp_warn("LED command failed, continuing without it: %s", error->message);
 +    g_error_free(error);
++    self->led_state = GOODIX55X4_LED_UNKNOWN;
 +  } else {
-+    // Commit the cached state only once the device has actually acknowledged.
-+    self->led_is_on = self->led_want_on;
++    // Resolve the cached state only now that the device has acknowledged.
++    self->led_state =
++        self->led_want_on ? GOODIX55X4_LED_ON : GOODIX55X4_LED_OFF;
 +  }
 +
 +  if (ssm)
@@ -484,29 +521,48 @@ index 20db582..06d29da 100644
 +  FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
 +  guint8 payload[3] = {on ? 0x00 : 0x01, on ? 0x01 : 0x00, 0x32};
 +
-+  // Already in the requested state: skip the command entirely. Sending it again
-+  // physically toggles the light, which is what made it blink on every retry
-+  // and between enrollment stages. Keep driving the SSM forward though.
-+  if (self->led_is_on == on) {
++  // Known to be in the requested state already: skip the command entirely.
++  // Sending it again physically toggles the light, which is what made it blink
++  // on every retry and between enrollment stages. Keep driving the SSM forward.
++  // UNKNOWN never matches, so an unacknowledged switch is always re-sent.
++  if (self->led_state == (on ? GOODIX55X4_LED_ON : GOODIX55X4_LED_OFF)) {
 +    if (ssm)
 +      fpi_ssm_next_state(ssm);
 +    return;
 +  }
 +
-+  // Do NOT commit led_is_on here: goodix_send_protocol() drops the command with
-+  // only a warning when the transport is still busy, and never calls back. A
-+  // state cached before the send would then claim the light is on while it is
-+  // dark, turning every later switch into a no-op.
++  // In flight: neither the old nor the new value is true right now. Only
++  // goodix55x4_led_done() may resolve this, and only on an acknowledgement --
++  // goodix_send_protocol() can drop the command with just a warning when the
++  // transport is busy, and goodix.c can drop a mismatched reply, and neither
++  // calls back at all.
++  self->led_state = GOODIX55X4_LED_UNKNOWN;
 +  self->led_want_on = on;
++  // reply=TRUE: the device does answer 0xae (observed: a0 06 00 a6 b0 03 00 ae
++  // 01 48). Claiming otherwise completed the command on the ACK alone, so the
++  // real reply landed while the transport was already waiting for the next
++  // command and was discarded as "Invalid protocol command: 0xae".
 +  goodix_send_protocol(dev, GOODIX_CMD_QUERY_MCU_STATE, payload,
-+                       sizeof(payload), NULL, TRUE, GOODIX_TIMEOUT, FALSE,
++                       sizeof(payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
 +                       goodix55x4_led_done, ssm);
++}
++
++// Switch the light off without consulting the cache, for the two points where we
++// take hold of the device and let go of it again. A cached "already off" must not
++// be trusted there: if it is wrong, the sensor is left lit with nothing running
++// that could ever switch it off — which is exactly the failure this replaced.
++// Nothing follows either call, so the redundant command cannot cause a blink.
++static void goodix55x4_clear_led(FpDevice *dev) {
++  FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
++
++  self->led_state = GOODIX55X4_LED_UNKNOWN;
++  goodix55x4_set_led(dev, FALSE, NULL);
 +}
 +
  static void check_none_cmd(FpDevice *dev, guint8 *data, guint16 len,
                             gpointer ssm, GError *err) {
    if (err) {
-@@ -429,26 +592,54 @@ static void squash_frame(Goodix55X4Pix *frame, guint8 *squashed) {
+@@ -429,26 +632,54 @@ static void squash_frame(Goodix55X4Pix *frame, guint8 *squashed) {
   * @param squashed
   */
  static void squash_frame_linear(Goodix55X4Pix *frame, guint8 *squashed) {
@@ -573,7 +629,7 @@ index 20db582..06d29da 100644
    }
  }
  
-@@ -480,6 +671,16 @@ postprocess_frame(Goodix55X4Pix frame[GOODIX55X4_FRAME_SIZE],
+@@ -480,6 +711,16 @@ postprocess_frame(Goodix55X4Pix frame[GOODIX55X4_FRAME_SIZE],
    return sum != 0;
  }
  
@@ -590,7 +646,7 @@ index 20db582..06d29da 100644
  typedef struct _frame_processing_info {
    FpiDeviceGoodixTls55X4 *dev;
    GSList **frames;
-@@ -502,6 +703,11 @@ static void save_frame(FpiDeviceGoodixTls55X4 *self, guint8 *raw) {
+@@ -502,6 +743,11 @@ static void save_frame(FpiDeviceGoodixTls55X4 *self, guint8 *raw) {
    self->frames = g_slist_append(self->frames, frame);
  }
  
@@ -602,7 +658,7 @@ index 20db582..06d29da 100644
  static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
                               gpointer ssm, GError *err) {
    g_print("SCAN_ON_READ_IMG\n");
-@@ -511,41 +717,93 @@ static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
+@@ -511,41 +757,93 @@ static void scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len,
    }
  
    FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
@@ -611,14 +667,14 @@ index 20db582..06d29da 100644
 -    fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
 -  } else {
 -    GSList *raw_frames = g_slist_nth(self->frames, 1);
- 
+-
 -    FpImageDevice *img_dev = FP_IMAGE_DEVICE(dev);
 -    struct fpi_frame_asmbl_ctx assembly_ctx;
 -    assembly_ctx.frame_width = GOODIX55X4_WIDTH;
 -    assembly_ctx.frame_height = GOODIX55X4_HEIGHT;
 -    assembly_ctx.image_width = GOODIX55X4_WIDTH * 1;
 -    assembly_ctx.get_pixel = get_pix;
--
+ 
 -    GSList *frames = NULL;
 -    frame_processing_info pinfo = {.dev = self, .frames = &frames};
 +  Goodix55X4Pix candidate[GOODIX55X4_FRAME_SIZE];
@@ -724,7 +780,7 @@ index 20db582..06d29da 100644
  }
  
  gboolean save_image_to_pgm2(guchar *data, const char *path) {
-@@ -607,11 +865,36 @@ gboolean save_image_to_pgm(FpImage *img, const char *path) {
+@@ -607,11 +905,36 @@ gboolean save_image_to_pgm(FpImage *img, const char *path) {
  }
  
  enum scan_empty_img_state {
@@ -761,7 +817,7 @@ index 20db582..06d29da 100644
  static void on_scan_empty_img(FpDevice *dev, guint8 *data, guint16 length,
                                gpointer ssm, GError *error) {
    if (error) {
-@@ -619,16 +902,132 @@ static void on_scan_empty_img(FpDevice *dev, guint8 *data, guint16 length,
+@@ -619,16 +942,132 @@ static void on_scan_empty_img(FpDevice *dev, guint8 *data, guint16 length,
      return;
    }
    FpiDeviceGoodixTls55X4 *self = FPI_DEVICE_GOODIXTLS55X4(dev);
@@ -898,7 +954,7 @@ index 20db582..06d29da 100644
    case SCAN_EMPTY_GET_IMG:
      goodix_tls_read_image(dev, on_scan_empty_img, ssm);
      break;
-@@ -665,23 +1064,50 @@ const guint8 fdt_switch_state_up_55X4[] = {
+@@ -665,23 +1104,50 @@ const guint8 fdt_switch_state_up_55X4[] = {
  
  static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
    FpImageDevice *img_dev = FP_IMAGE_DEVICE(dev);
@@ -956,7 +1012,7 @@ index 20db582..06d29da 100644
      break;
    case SCAN_STAGE_GET_IMG:
      g_print("SWITCH TO GET IMAGE\n");
-@@ -696,21 +1122,45 @@ static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
+@@ -696,21 +1162,45 @@ static void scan_run_state(FpiSsm *ssm, FpDevice *dev) {
      break;
    case SCAN_STAGE_SWITCH_TO_FDT_MODE2:
      g_print("SWITCH TO FDT MODE 2\n");
@@ -1012,7 +1068,7 @@ index 20db582..06d29da 100644
      break;
    case SCAN_STAGE_SWITCH_TO_FDT_DONE:
      fpi_image_device_report_finger_status(img_dev, FALSE);
-@@ -772,6 +1222,7 @@ static void sleep_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
+@@ -772,6 +1262,7 @@ static void sleep_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
  }
  
  static void scan_start(FpiDeviceGoodixTls55X4 *dev) {
@@ -1020,7 +1076,7 @@ index 20db582..06d29da 100644
    fpi_ssm_start(fpi_ssm_new(FP_DEVICE(dev), scan_run_state, SCAN_STAGE_NUM),
                  scan_complete);
  }
-@@ -787,6 +1238,7 @@ static void sleep_start(FpDevice *dev, gpointer user_data) {
+@@ -787,6 +1278,7 @@ static void sleep_start(FpDevice *dev, gpointer user_data) {
  
  static void dev_init(FpImageDevice *img_dev) {
    FpDevice *dev = FP_DEVICE(img_dev);
@@ -1028,21 +1084,20 @@ index 20db582..06d29da 100644
    GError *error = NULL;
  
    if (goodix_dev_init(dev, &error)) {
-@@ -794,6 +1246,13 @@ static void dev_init(FpImageDevice *img_dev) {
+@@ -794,6 +1286,12 @@ static void dev_init(FpImageDevice *img_dev) {
      return;
    }
  
 +  // Start from a known-dark sensor. Clearing the light on close is not enough
 +  // on its own: a killed or crashed fprintd never reaches close, and the sensor
-+  // then sits lit with nobody left to switch it off. Cached state is reset too,
-+  // since the light may have survived from a previous process.
-+  self->led_is_on = TRUE;   // force the switch to be actually sent
-+  goodix55x4_set_led(dev, FALSE, NULL);
++  // then sits lit with nobody left to switch it off. The light may also have
++  // survived from a previous process, so nothing about it is known here.
++  goodix55x4_clear_led(dev);
 +
    fpi_image_device_open_complete(img_dev, NULL);
  }
  
-@@ -801,6 +1260,16 @@ static void dev_deinit(FpImageDevice *img_dev) {
+@@ -801,6 +1299,16 @@ static void dev_deinit(FpImageDevice *img_dev) {
    FpDevice *dev = FP_DEVICE(img_dev);
    GError *error = NULL;
  
@@ -1054,12 +1109,12 @@ index 20db582..06d29da 100644
 +  // track. The write itself is synchronous, so it lands before the interface is
 +  // released below.
 +  goodix_reset_state(dev);
-+  goodix55x4_set_led(dev, FALSE, NULL);
++  goodix55x4_clear_led(dev);
 +
    if (goodix_dev_deinit(dev, &error)) {
      fpi_image_device_close_complete(img_dev, error);
      return;
-@@ -838,7 +1307,7 @@ static void dev_deactivate(FpImageDevice *img_dev) {
+@@ -838,7 +1346,7 @@ static void dev_deactivate(FpImageDevice *img_dev) {
  // ---- DEV SECTION END ----
  
  static void fpi_device_goodixtls55x4_init(FpiDeviceGoodixTls55X4 *self) {
@@ -1068,7 +1123,7 @@ index 20db582..06d29da 100644
  }
  
  static void
-@@ -855,7 +1324,11 @@ fpi_device_goodixtls55x4_class_init(FpiDeviceGoodixTls55X4Class *class) {
+@@ -855,7 +1363,11 @@ fpi_device_goodixtls55x4_class_init(FpiDeviceGoodixTls55X4Class *class) {
    dev_class->full_name = "Goodix TLS Fingerprint Sensor 55X4";
    dev_class->type = FP_DEVICE_TYPE_USB;
    dev_class->id_table = id_table;
