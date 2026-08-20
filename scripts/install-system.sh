@@ -26,21 +26,59 @@ if [ ! -f "$SO_SRC/libfprint-2.so.2.0.0" ]; then
   exit 1
 fi
 
-echo "== 1/6 install our libfprint into $DEST =="
+echo "== 1/7 install our libfprint into $DEST =="
 install -d "$DEST"
 install -m0755 "$SO_SRC/libfprint-2.so.2.0.0" "$DEST/"
 ln -sf libfprint-2.so.2.0.0 "$DEST/libfprint-2.so.2"
 ln -sf libfprint-2.so.2     "$DEST/libfprint-2.so"
 restorecon -R "$DEST" 2>/dev/null || true   # correct SELinux labels
 
-echo "== 2/6 systemd drop-in: point ONLY fprintd at it =="
+echo "== 2/7 systemd drop-in: point ONLY fprintd at it =="
 install -d "$DROPIN"
 cat > "$DROPIN/10-goodix55a4.conf" <<EOF
 [Service]
 Environment=LD_LIBRARY_PATH=$DEST
 EOF
 
-echo "== 3/6 provision the sensor key (one-time) =="
+echo "== 3/7 survive suspend/resume =="
+# fprintd keeps a verify running for the lock screen at all times. On system
+# suspend it tries to pause the device mid-operation, fails ("Unexpected error
+# while suspending device: ... still busy"), and the device object stays
+# claimed by a session that no longer exists — every unlock after resume is
+# then refused with "Device was already claimed" until fprintd restarts. To
+# the user that reads as the reader randomly dying until a reboot. So: stop
+# fprintd cleanly before sleep, restart it on resume. It is D-Bus-activated,
+# so the restart costs nothing when nobody is asking for it. The unit is
+# started by sleep.target (stopping fprintd), becomes unneeded when
+# sleep.target stops on resume, and its ExecStop brings fprintd back.
+cat > /etc/systemd/system/fprintd-sleep-fix.service <<'EOF'
+[Unit]
+Description=Release Goodix fingerprint sensor around suspend (stale-claim fix)
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/systemctl stop fprintd.service
+ExecStop=/usr/bin/systemctl restart fprintd.service
+
+[Install]
+WantedBy=sleep.target
+EOF
+systemctl daemon-reload
+systemctl enable -q fprintd-sleep-fix.service
+# Runtime USB autosuspend (kernel default: 2 s idle) is a second source of the
+# same "worked yesterday, dead today" flakiness on this sensor; keep it
+# powered. The rule matches on "add", which only fires at boot or replug — so
+# trigger with --action=add to apply it to the device already plugged in.
+echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="27c6", ATTR{idProduct}=="55a4", ATTR{power/control}="on"' \
+  > /etc/udev/rules.d/61-goodix-no-autosuspend.rules
+udevadm control --reload
+udevadm trigger --action=add --subsystem-match=usb \
+  --attr-match=idVendor=27c6 --attr-match=idProduct=55a4 2>/dev/null || true
+
+echo "== 4/7 provision the sensor key (one-time) =="
 # The driver talks TLS-PSK with an all-zero key, which the sensor only accepts
 # once a fixed, publicly known blob has been written into it (it ships in
 # goodix-fp-dump and is not device-specific). The C driver deliberately only
@@ -71,7 +109,7 @@ else
   echo "   skipped: no $PYBIN (run ./install.sh or ./setup.sh first)"
 fi
 
-echo "== 4/6 SELinux: stop logging the harmless nr_hugepages probe =="
+echo "== 5/7 SELinux: stop logging the harmless nr_hugepages probe =="
 # fprintd now loads our libfprint, which links OpenCV for the SIGFM matcher.
 # OpenCV pulls in Intel TBB, whose scalable allocator reads
 # /proc/sys/vm/nr_hugepages at init and falls back to normal pages when it
@@ -109,14 +147,14 @@ else
   fi
 fi
 
-echo "== 5/6 restart fprintd =="
+echo "== 6/7 restart fprintd =="
 systemctl stop fprintd.service 2>/dev/null || true
 pkill -TERM -x fprintd 2>/dev/null || true
 sleep 1
 systemctl daemon-reload
 systemctl restart fprintd.service 2>/dev/null || true   # dbus-activated; ok if not running
 
-echo "== 6/6 PAM (authselect with-fingerprint) =="
+echo "== 7/7 PAM (authselect with-fingerprint) =="
 if authselect current 2>/dev/null | grep -q with-fingerprint; then
   echo "   with-fingerprint already enabled"
 else

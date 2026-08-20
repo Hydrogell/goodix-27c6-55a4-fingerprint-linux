@@ -12,6 +12,12 @@ rmdir --ignore-fail-on-non-empty /etc/systemd/system/fprintd.service.d 2>/dev/nu
 echo "== remove installed lib =="
 rm -rf /opt/libfprint-goodix
 
+echo "== remove suspend/resume unit and udev rule =="
+systemctl disable -q fprintd-sleep-fix.service 2>/dev/null || true
+rm -f /etc/systemd/system/fprintd-sleep-fix.service
+rm -f /etc/udev/rules.d/61-goodix-no-autosuspend.rules
+udevadm control --reload 2>/dev/null || true
+
 echo "== remove SELinux policy module =="
 # install-system.sh loads scripts/goodix_fprintd.te on enforcing systems, to
 # keep OpenCV/TBB's nr_hugepages probe out of the audit log.

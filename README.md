@@ -151,6 +151,17 @@ It does **not** replace or downgrade your distribution's libfprint. The patched
 build goes to `/opt/libfprint-goodix`, and a systemd drop-in points *only*
 `fprintd` at it. Everything else on the system keeps using the distro library.
 
+It installs two small guards against the sensor dying across suspend. fprintd
+keeps a verify running for the lock screen at all times; suspending the machine
+mid-operation fails to pause the device (*"Unexpected error while suspending
+device: ... still busy"*) and leaves it claimed by a session that no longer
+exists, so every unlock after resume is refused with *"Device was already
+claimed"* until fprintd restarts — which presents as the reader randomly dying
+until a reboot. A one-shot systemd unit (`fprintd-sleep-fix.service`) stops
+fprintd cleanly before sleep and restarts it on resume, and a udev rule
+disables USB runtime autosuspend for the sensor, a second source of the same
+flakiness.
+
 It also provisions the sensor key (see below), checks whether your fingerprint
 templates land on an encrypted filesystem, and reports whether SELinux is
 enforcing.
@@ -167,8 +178,8 @@ with-fingerprint` on Fedora — so GDM, `login` and `sudo` will all accept a
 fingerprint afterwards. If you only want enrolment and testing, comment that
 step out before running the installer.
 
-`sudo bash scripts/uninstall-system.sh` removes the library, the systemd drop-in
-and the policy module. Three things it does not undo: PAM keeps accepting
+`sudo bash scripts/uninstall-system.sh` removes the library, the systemd
+drop-in, the suspend/resume unit, the udev rule and the policy module. Three things it does not undo: PAM keeps accepting
 fingerprints — turn that off with `authselect disable-feature with-fingerprint`;
 the key written into the sensor is permanent (it goes in a different slot from
 the one the stock Windows driver uses — see [The sensor key](#the-sensor-key));
