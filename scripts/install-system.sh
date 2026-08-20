@@ -74,7 +74,7 @@ systemctl enable -q fprintd-sleep-fix.service
 # trigger with --action=add to apply it to the device already plugged in.
 echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="27c6", ATTR{idProduct}=="55a4", ATTR{power/control}="on"' \
   > /etc/udev/rules.d/61-goodix-no-autosuspend.rules
-udevadm control --reload
+udevadm control --reload-rules
 udevadm trigger --action=add --subsystem-match=usb \
   --attr-match=idVendor=27c6 --attr-match=idProduct=55a4 2>/dev/null || true
 
