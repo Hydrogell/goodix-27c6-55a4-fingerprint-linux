@@ -4,13 +4,20 @@
 # (delete with `fprintd-delete $USER` if wanted).
 set -e
 DROPIN="/etc/systemd/system/fprintd.service.d/10-goodix55a4.conf"
+RUNMAX="/etc/systemd/system/fprintd.service.d/20-goodix-runtime-max.conf"
 
-echo "== remove systemd drop-in =="
-rm -f "$DROPIN"
+echo "== remove systemd drop-ins =="
+rm -f "$DROPIN" "$RUNMAX"
 rmdir --ignore-fail-on-non-empty /etc/systemd/system/fprintd.service.d 2>/dev/null || true
 
 echo "== remove installed lib =="
 rm -rf /opt/libfprint-goodix
+
+echo "== remove suspend/resume unit and udev rule =="
+systemctl disable -q fprintd-sleep-fix.service 2>/dev/null || true
+rm -f /etc/systemd/system/fprintd-sleep-fix.service
+rm -f /etc/udev/rules.d/61-goodix-no-autosuspend.rules
+udevadm control --reload 2>/dev/null || true
 
 echo "== remove SELinux policy module =="
 # install-system.sh loads scripts/goodix_fprintd.te on enforcing systems, to

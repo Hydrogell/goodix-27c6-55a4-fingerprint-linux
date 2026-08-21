@@ -6,9 +6,12 @@
 #
 #   /opt/libfprint-goodix/lib64/libfprint-2.so.*      the patched library
 #   /etc/systemd/system/fprintd.service.d/10-*.conf   points fprintd at it
+#   /etc/systemd/system/fprintd.service.d/20-*.conf   caps fprintd's lifetime (self-heals leaked claims)
+#   /etc/systemd/system/fprintd-sleep-fix.service     restarts fprintd around suspend
+#   /etc/udev/rules.d/61-goodix-no-autosuspend.rules  keeps the sensor powered
 #   one SELinux policy module (enforcing systems only)
 #
-# scripts/uninstall-system.sh removes all three.
+# scripts/uninstall-system.sh removes all six.
 #
 # Your distribution's own libfprint is neither replaced nor downgraded — only
 # fprintd is redirected, every other program keeps using the system library.
