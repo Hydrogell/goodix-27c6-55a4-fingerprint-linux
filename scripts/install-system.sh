@@ -77,6 +77,20 @@ echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="27c6", ATTR{idProduct}==
 udevadm control --reload-rules
 udevadm trigger --action=add --subsystem-match=usb \
   --attr-match=idVendor=27c6 --attr-match=idProduct=55a4 2>/dev/null || true
+# Suspend is not the only way to lose the device to a stale claim. pam_fprintd
+# runs inside GDM's session worker, which is reused for every unlock and lives
+# until logout; cancel it mid-verify — type the password while the sensor is
+# scanning — and it can leak its claim. fprintd cannot auto-release a claim
+# whose holder is still alive, so the sensor is dead until fprintd restarts.
+# The detector is fprintd's own lifetime: it is D-Bus-activated and idle-exits
+# in ~30 s, so only a held claim keeps it running long. Cap it — systemd kills
+# a wedged instance and the next unlock respawns a fresh one in milliseconds.
+# 600 s comfortably outlasts the longest legitimate hold (a 16-touch enroll).
+cat > "$DROPIN/20-goodix-runtime-max.conf" <<'EOF'
+[Service]
+RuntimeMaxSec=600
+EOF
+systemctl daemon-reload
 
 echo "== 4/7 provision the sensor key (one-time) =="
 # The driver talks TLS-PSK with an all-zero key, which the sensor only accepts

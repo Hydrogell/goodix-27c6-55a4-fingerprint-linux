@@ -4,9 +4,10 @@
 # (delete with `fprintd-delete $USER` if wanted).
 set -e
 DROPIN="/etc/systemd/system/fprintd.service.d/10-goodix55a4.conf"
+RUNMAX="/etc/systemd/system/fprintd.service.d/20-goodix-runtime-max.conf"
 
-echo "== remove systemd drop-in =="
-rm -f "$DROPIN"
+echo "== remove systemd drop-ins =="
+rm -f "$DROPIN" "$RUNMAX"
 rmdir --ignore-fail-on-non-empty /etc/systemd/system/fprintd.service.d 2>/dev/null || true
 
 echo "== remove installed lib =="

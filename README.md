@@ -162,6 +162,14 @@ fprintd cleanly before sleep and restarts it on resume, and a udev rule
 disables USB runtime autosuspend for the sensor, a second source of the same
 flakiness.
 
+The claim can also leak without suspend: pam_fprintd runs inside GDM's
+long-lived session worker, and cancelling it mid-verify — typing the password
+while the sensor is scanning — can leave the claim held until logout, which
+fprintd cannot auto-release while the holder is alive. A second drop-in caps
+fprintd with `RuntimeMaxSec=600`: it is D-Bus-activated and idle-exits in
+~30 s, so only a held claim keeps it running that long — systemd kills the
+wedged instance and the next unlock respawns a fresh one.
+
 It also provisions the sensor key (see below), checks whether your fingerprint
 templates land on an encrypted filesystem, and reports whether SELinux is
 enforcing.
@@ -178,8 +186,8 @@ with-fingerprint` on Fedora — so GDM, `login` and `sudo` will all accept a
 fingerprint afterwards. If you only want enrolment and testing, comment that
 step out before running the installer.
 
-`sudo bash scripts/uninstall-system.sh` removes the library, the systemd
-drop-in, the suspend/resume unit, the udev rule and the policy module. Three things it does not undo: PAM keeps accepting
+`sudo bash scripts/uninstall-system.sh` removes the library, both systemd
+drop-ins, the suspend/resume unit, the udev rule and the policy module. Three things it does not undo: PAM keeps accepting
 fingerprints — turn that off with `authselect disable-feature with-fingerprint`;
 the key written into the sensor is permanent (it goes in a different slot from
 the one the stock Windows driver uses — see [The sensor key](#the-sensor-key));
