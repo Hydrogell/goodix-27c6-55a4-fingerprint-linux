@@ -56,7 +56,7 @@ run_capture () {  # $1=label  $2...=command (run as RUSER)
 # 1) failing native C driver
 run_capture "c-fail" \
   env G_MESSAGES_DEBUG=all timeout 20 \
-  "$REPO/work/twd-libfprint/_build/examples/img-capture" /tmp/cdiff_out.pgm
+  "$REPO/work/twd-libfprint/build/examples/img-capture" /tmp/cdiff_out.pgm
 
 sleep 2
 

@@ -13,7 +13,7 @@ set -e
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # Where the build lives. Defaults to the developer tree left by ./setup.sh;
 # ./install.sh overrides both to a temporary directory it deletes afterwards.
-SO_SRC="${FP_SO_SRC:-$REPO/work/twd-libfprint/_build/libfprint}"
+SO_SRC="${FP_SO_SRC:-$REPO/work/twd-libfprint/build/libfprint}"
 PYDIR="${FP_PYDIR:-$REPO/work/goodix-fp-dump}"
 DEST="/opt/libfprint-goodix/lib64"
 DROPIN="/etc/systemd/system/fprintd.service.d"
@@ -116,11 +116,15 @@ sleep 1
 systemctl daemon-reload
 systemctl restart fprintd.service 2>/dev/null || true   # dbus-activated; ok if not running
 
-echo "== 6/6 PAM (authselect with-fingerprint) =="
-if authselect current 2>/dev/null | grep -q with-fingerprint; then
-  echo "   with-fingerprint already enabled"
+echo "== 6/6 PAM =="
+if command -v authselect >/dev/null 2>&1; then
+  if authselect current 2>/dev/null | grep -q with-fingerprint; then
+    echo "   with-fingerprint already enabled"
+  else
+    authselect enable-feature with-fingerprint && echo "   enabled with-fingerprint"
+  fi
 else
-  authselect enable-feature with-fingerprint && echo "   enabled with-fingerprint"
+  echo "   skipped: no authselect (Debian/Ubuntu: sudo pam-auth-update)"
 fi
 
 echo "== template protection check =="

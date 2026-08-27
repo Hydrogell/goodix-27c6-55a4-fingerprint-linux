@@ -47,14 +47,10 @@ if [ "$(id -u)" -eq 0 ]; then
   exit 1
 fi
 
-for c in git meson ninja python3 gcc; do
+for c in git meson ninja python3 gcc g++; do
   command -v "$c" >/dev/null 2>&1 || {
     echo "missing: $c" >&2
-    echo "On Fedora:" >&2
-    echo "  sudo dnf install meson ninja-build gcc gcc-c++ libgusb-devel \\" >&2
-    echo "      nss-devel openssl-devel cairo-devel glib2-devel opencv-devel \\" >&2
-    echo "      gobject-introspection-devel libgudev-devel pixman-devel \\" >&2
-    echo "      doctest-devel cmake git" >&2
+    "$REPO/scripts/print-build-deps.sh"
     exit 1
   }
 done
@@ -79,10 +75,7 @@ echo "== 1/3 build the patched libfprint =="
 git clone -q --branch 55b4-experimental "$FORK_URL" "$BUILD/libfprint"
 pin "$BUILD/libfprint" "$FORK_REV"
 git -C "$BUILD/libfprint" apply "$REPO/patches/55a4-driver.patch"
-( cd "$BUILD/libfprint" \
-  && meson setup _build -Ddrivers=goodixtls55x4 -Dintrospection=false \
-       -Ddoc=false >/dev/null \
-  && ninja -C _build >/dev/null )
+"$REPO/scripts/meson-build-libfprint.sh" "$BUILD/libfprint"
 echo "   built"
 
 # The sensor only accepts the all-zero TLS key once a fixed public blob has been
@@ -104,6 +97,6 @@ echo "   ready"
 
 echo "== 3/3 install (needs sudo) =="
 sudo env \
-  FP_SO_SRC="$BUILD/libfprint/_build/libfprint" \
+  FP_SO_SRC="$BUILD/libfprint/build/libfprint" \
   FP_PYDIR="$BUILD/goodix-fp-dump" \
   bash "$REPO/scripts/install-system.sh"

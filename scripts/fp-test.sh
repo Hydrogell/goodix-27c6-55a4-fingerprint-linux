@@ -6,7 +6,7 @@
 # Usage: scripts/fp-test.sh [seconds]   (default 60)
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$REPO/work/twd-libfprint/_build/examples/img-capture"
+BIN="$REPO/work/twd-libfprint/build/examples/img-capture"
 SECS="${1:-60}"
 LOG="${FP_TEST_LOG:-/tmp/fp-test.log}"
 OUT="${FP_TEST_PGM:-/tmp/fp-test.pgm}"

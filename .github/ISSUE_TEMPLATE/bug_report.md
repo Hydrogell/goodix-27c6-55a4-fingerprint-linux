@@ -49,7 +49,7 @@ trace really does turn out to be necessary.
 Run this from the repository and paste the **terminal output**:
 
 ```sh
-G_MESSAGES_DEBUG=all work/twd-libfprint/_build/examples/img-capture /tmp/out.pgm
+G_MESSAGES_DEBUG=all work/twd-libfprint/build/examples/img-capture /tmp/out.pgm
 ```
 
 (If you used `./install.sh` there is no `work/` directory — run `./setup.sh`
