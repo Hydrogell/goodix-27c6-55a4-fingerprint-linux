@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Configure and compile patched libfprint into $1/build.
 #
-# TheWeirdDev ships a stub _build/ (ignore files only). `meson setup --wipe`
-# requires a real build tree, and `meson setup _build` fails because that
-# directory already exists. A separate `build/` directory avoids both.
+# setup.sh used to run `meson setup _build --wipe`. On a fresh clone there is
+# no build tree yet, and meson 0.61 (Ubuntu 22.04) refuses --wipe when nothing
+# exists to wipe; current meson quietly accepts that, which is why the failure
+# only ever showed up off the development machine (#3). A dedicated build/
+# recreated from scratch needs no --wipe on any meson version.
 set -e
 SRC="$1"
 if [ ! -d "$SRC" ] || [ ! -f "$SRC/meson.build" ]; then
