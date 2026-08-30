@@ -257,13 +257,13 @@ in operation as ground truth.
 git clone https://github.com/Hydrogell/goodix-27c6-55a4-fingerprint-linux
 cd goodix-27c6-55a4-fingerprint-linux && ./setup.sh
 ```
-Builds `work/twd-libfprint/_build/examples/img-capture` (native driver) and
+Builds `work/twd-libfprint/build/examples/img-capture` (native driver) and
 `work/goodix-fp-dump` (Python reference).
 Build deps (Fedora): meson ninja-build gcc gcc-c++ libgusb-devel nss-devel
 openssl-devel cairo-devel glib2-devel opencv-devel gobject-introspection-devel
 libgudev-devel pixman-devel doctest-devel cmake.
 
-Test: `G_MESSAGES_DEBUG=all work/twd-libfprint/_build/examples/img-capture /tmp/out.pgm`
+Test: `G_MESSAGES_DEBUG=all work/twd-libfprint/build/examples/img-capture /tmp/out.pgm`
 (place a finger when it reaches await-finger; ~9.5 KB PGM 108x88 with ridges).
 
 ## What the patch (`55a4-driver.patch`) contains
@@ -303,7 +303,7 @@ screen. What is still open is proper distribution:
 2. **Port to current upstream libfprint** (1.94.10) and carry only the driver
    as a distro patch — the real "upstream-quality" path. This branch is
    1.94.6-era; the driver + sigfm need forward-porting.
-3. Quick-and-dirty: `sudo ninja -C _build install` overwrites system libfprint
+3. Quick-and-dirty: `sudo ninja -C build install` overwrites system libfprint
    — a DOWNGRADE (1.94.6 < 1.94.10), gets clobbered by updates. Not recommended.
 
 The PAM wiring the installer performs is `authselect enable-feature

@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Reconstruct the FULL working environment for the Goodix 27c6:55a4 driver work.
 # Everything lives under this repo's work/ dir (persistent home, NOT /tmp).
-# Re-run any time (idempotent). Needs: meson ninja-build gcc gcc-c++ libgusb-devel
-# nss-devel openssl-devel cairo-devel glib2-devel opencv-devel
-# gobject-introspection-devel libgudev-devel pixman-devel doctest-devel cmake git
+# Re-run any time (idempotent). Build deps: scripts/print-build-deps.sh
 set -e
 REPO="$(cd "$(dirname "$0")" && pwd)"
 WORK="$REPO/work"
@@ -33,9 +31,8 @@ fi
 cd "$WORK/twd-libfprint"
 git checkout -- . 2>/dev/null || true
 git apply "$REPO/patches/55a4-driver.patch"
-meson setup _build -Ddrivers=goodixtls55x4 -Dintrospection=false -Ddoc=false --wipe >/dev/null
-ninja -C _build
-echo "   -> $WORK/twd-libfprint/_build/examples/img-capture"
+"$REPO/scripts/meson-build-libfprint.sh" "$WORK/twd-libfprint"
+echo "   -> $WORK/twd-libfprint/build/examples/img-capture"
 
 echo "== 2/2 goodix-fp-dump Python reference (known-good, pinned) =="
 if [ ! -d "$WORK/goodix-fp-dump/.git" ]; then
@@ -58,4 +55,4 @@ echo "   -> $WORK/goodix-fp-dump  (Python reference tooling)"
 
 echo ""
 echo "DONE. Native driver test (needs sensor + udev uaccess, no sudo):"
-echo "  G_MESSAGES_DEBUG=all $WORK/twd-libfprint/_build/examples/img-capture /tmp/out.pgm"
+echo "  G_MESSAGES_DEBUG=all $WORK/twd-libfprint/build/examples/img-capture /tmp/out.pgm"

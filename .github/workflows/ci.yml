@@ -77,10 +77,29 @@ jobs:
             https://github.com/TheWeirdDev/libfprint.git /tmp/base
           git -C /tmp/base checkout -q "$rev"
           git -C /tmp/base apply "$GITHUB_WORKSPACE/patches/55a4-driver.patch"
-          cd /tmp/base
-          meson setup _build -Ddrivers=goodixtls55x4 -Dintrospection=false -Ddoc=false
-          ninja -C _build
-          test -f _build/libfprint/libfprint-2.so.2.0.0
+          bash "$GITHUB_WORKSPACE/scripts/meson-build-libfprint.sh" /tmp/base
+          test -f /tmp/base/build/libfprint/libfprint-2.so.2.0.0
+
+  build-ubuntu:
+    name: build on Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq meson ninja-build gcc g++ cmake pkg-config \
+            libglib2.0-dev libgusb-dev libusb-1.0-0-dev libnss3-dev libssl-dev \
+            libcairo2-dev libpixman-1-dev libgudev-1.0-dev libopencv-dev doctest-dev
+      - name: apply the patch and compile
+        run: |
+          rev=$(grep -oE 'FORK_REV="[0-9a-f]{40}"' install.sh | grep -oE '[0-9a-f]{40}')
+          git clone -q --branch 55b4-experimental \
+            https://github.com/TheWeirdDev/libfprint.git /tmp/base
+          git -C /tmp/base checkout -q "$rev"
+          git -C /tmp/base apply "$GITHUB_WORKSPACE/patches/55a4-driver.patch"
+          bash "$GITHUB_WORKSPACE/scripts/meson-build-libfprint.sh" /tmp/base
+          test -f /tmp/base/build/libfprint/libfprint-2.so.2.0.0
 
   privacy:
     name: no captured data in the tree

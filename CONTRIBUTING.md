@@ -17,7 +17,7 @@ bug report is text, not captures. Include:
 - a run of the image-capture test, from the repository root, with debug logging:
 
 ```sh
-G_MESSAGES_DEBUG=all work/twd-libfprint/_build/examples/img-capture /tmp/out.pgm
+G_MESSAGES_DEBUG=all work/twd-libfprint/build/examples/img-capture /tmp/out.pgm
 ```
 
 Paste the **terminal output** of that command — a protocol log of commands, ACKs,
@@ -60,7 +60,7 @@ and the branch tip moves.
 
 `./setup.sh` clones that base into `work/twd-libfprint` and applies the patch to
 the working tree, so the checkout is "base + patch, uncommitted". Edit the source
-there, rebuild with `ninja -C _build`, then regenerate the diff:
+there, rebuild with `ninja -C build`, then regenerate the diff:
 
 ```sh
 cd work/twd-libfprint

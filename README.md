@@ -79,9 +79,8 @@ trials, which is not reachable by hand.
 ## Install
 
 Developed and tested on **Fedora 44**, against `fprintd` 1.94.5 and the distro's
-own `libfprint` 1.94.10, kernel 7.1, Python 3.14. Nothing here is version-specific
-in principle, and other distributions should work — but nobody has tried, so if
-you are the first, a report either way is welcome.
+own `libfprint` 1.94.10, kernel 7.1, Python 3.14. Ubuntu 22.04 is reported
+working in #2. Other distributions should work — a report either way is welcome.
 
 Build dependencies first:
 
@@ -89,6 +88,14 @@ Build dependencies first:
 sudo dnf install meson ninja-build gcc gcc-c++ libgusb-devel nss-devel \
     openssl-devel cairo-devel glib2-devel opencv-devel \
     gobject-introspection-devel libgudev-devel pixman-devel doctest-devel cmake
+```
+
+Debian/Ubuntu (tested on 22.04, ThinkPad E14 Gen 2 — see #2):
+
+```sh
+sudo apt install meson ninja-build gcc g++ cmake pkg-config git \
+    libglib2.0-dev libgusb-dev libusb-1.0-0-dev libnss3-dev libssl-dev \
+    libcairo2-dev libpixman-1-dev libgudev-1.0-dev libopencv-dev doctest-dev
 ```
 
 Then:
